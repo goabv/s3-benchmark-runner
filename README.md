@@ -1,4 +1,4 @@
-# S3 part-boundary download benchmark — AWS SDK for JavaScript v3
+# S3 Benchmark Runner — AWS SDK for JavaScript v3
 
 Measures parallel download throughput from S3 using **worker threads**, where each
 worker downloads objects **by `PartNumber`** on top of `@aws-sdk/client-s3`.
@@ -6,16 +6,6 @@ Requesting a part by number (rather than an arbitrary byte range) aligns every
 request to the object's original multipart-upload boundaries and makes S3 return
 that part's stored **CRC32** checksum — which the SDK validates automatically as
 the body is read. Reports throughput (MiB/s and Gbps) per object.
-
-## Why PartNumber instead of byte ranges
-
-Per-part checksums are only returned when you GET a part by number with
-`ChecksumMode: ENABLED`. A byte-`Range` GET returns bytes but no part checksum,
-and a whole-object GET of a multipart object only exposes the *composite*
-checksum (a checksum-of-checksums), which can't be validated against the raw
-stream. So to verify CRC32 at part granularity, the download unit must be the
-part number. The SDK (default `responseChecksumValidation: WHEN_SUPPORTED`)
-validates each part as it streams; a mismatch throws and the run reports an error.
 
 ## What it does
 
