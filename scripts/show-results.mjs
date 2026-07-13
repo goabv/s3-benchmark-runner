@@ -21,7 +21,7 @@ const pad = (s, n) => String(s).padEnd(n);
 const padS = (s, n) => String(s).padStart(n);
 
 console.log(`\n=== S3 ${isUpload ? 'multipart UPLOAD' : 'part-boundary download'} benchmark (AWS SDK JS v3) ===`);
-console.log(`sdk=@aws-sdk/client-s3@${j.sdkVersion}  @smithy/core@${j.smithyCoreVersion}`);
+console.log(`node=${j.nodeVersion ?? '(not recorded)'}  sdk=@aws-sdk/client-s3@${j.sdkVersion}  @smithy/core@${j.smithyCoreVersion}`);
 console.log(`region=${cfg.region ?? '(default)'}  bucket=${cfg.bucket}`);
 if (isUpload) {
   console.log(

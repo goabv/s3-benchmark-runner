@@ -676,7 +676,7 @@ async function benchmarkGroup(cfg, group) {
 
 function printHuman(cfg, all) {
   console.log('\n=== S3 part-boundary download benchmark (AWS SDK JS v3) ===');
-  console.log(`sdk=@aws-sdk/client-s3@${SDK_VERSION}  @smithy/core@${SMITHY_CORE_VERSION}`);
+  console.log(`node=${process.version}  sdk=@aws-sdk/client-s3@${SDK_VERSION}  @smithy/core@${SMITHY_CORE_VERSION}`);
   console.log(`region=${cfg.region ?? '(default)'}  bucket=${cfg.bucket}`);
   const tlsNote = cfg.tls
     ? (() => {
@@ -833,6 +833,7 @@ async function main() {
 
   const payload = JSON.stringify(
     {
+      nodeVersion: process.version,
       sdkVersion: SDK_VERSION,
       smithyCoreVersion: SMITHY_CORE_VERSION,
       config: { ...cfg },

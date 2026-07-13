@@ -34,10 +34,10 @@
     "concurrency": 4,
     "iterations": 1,
     "warmup": 1,
-    "httpHandler": "undici",
+    "httpHandler": "node",
     "forceUpload": false,
     "uploadSource": "memory",
-    "spreadConnections": false,
+    "spreadConnections": true,
     "ipThroughputSizes": []
   }
 }

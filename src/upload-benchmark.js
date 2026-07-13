@@ -373,7 +373,7 @@ function uploadTlsNote(cfg, all) {
 
 function printHuman(cfg, all) {
   console.log('\n=== S3 multipart UPLOAD benchmark (AWS SDK JS v3) ===');
-  console.log(`sdk=@aws-sdk/client-s3@${SDK_VERSION}  @smithy/core@${SMITHY_CORE_VERSION}`);
+  console.log(`node=${process.version}  sdk=@aws-sdk/client-s3@${SDK_VERSION}  @smithy/core@${SMITHY_CORE_VERSION}`);
   console.log(`region=${cfg.region ?? '(default)'}  bucket=${cfg.bucket}`);
   console.log(
     `source=${cfg.uploadSource}  handler=${cfg.httpHandler}  transport=${uploadTlsNote(cfg, all)}  ` +
@@ -454,7 +454,7 @@ async function main() {
   }
 
   const payload = JSON.stringify(
-    { mode: 'upload', sdkVersion: SDK_VERSION, smithyCoreVersion: SMITHY_CORE_VERSION, config: { ...cfg }, results: all },
+    { mode: 'upload', nodeVersion: process.version, sdkVersion: SDK_VERSION, smithyCoreVersion: SMITHY_CORE_VERSION, config: { ...cfg }, results: all },
     null,
     2,
   );
