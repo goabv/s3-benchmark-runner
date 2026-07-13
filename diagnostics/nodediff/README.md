@@ -47,6 +47,20 @@ culprit:
 - **loopback fine but `s3-single` regressed** → something on the **S3 network path**
   (DNS, handshake to S3, congestion) or the **SDK** path, not node core.
 
+## Extra knobs
+
+- **Client path** — `loopback.mjs --client fetch` runs the receive over **global
+  fetch = the bundled undici** (whose version changes across node releases), vs the
+  default `--client node` (core `http`/`https`). If node http regresses but fetch
+  doesn't, the regression is in **node core streams** and switching to the undici
+  handler may sidestep it; if fetch regresses too, it's a shared/undici layer.
+- **GC accounting** — add `--gc-stats` to any loopback run to print GC event count,
+  total pause, and % of wall time. If the slower version shows markedly higher GC%,
+  the regression is **GC-driven** (a V8 change); try `--max-semi-space-size=<MB>`
+  (e.g. `NODE_OPTIONS=--max-semi-space-size=128`) to test.
+
+The runner exercises both node and fetch clients (with `--gc-stats`) automatically.
+
 ## Notes
 
 - The loopback server and client run in the same process (single event loop), so
@@ -55,3 +69,5 @@ culprit:
 - Bump `--duration`, `--conns`, `--size` for steadier numbers on a big box.
 - `s3-single.mjs` reads bucket/region/sizes from `bench.config.json`; override with
   `--key`, `--part`, `--handler`, `--cipher`, `--no-checksum`.
+- `--client fetch` disables TLS cert verification for the loopback self-signed cert
+  (`NODE_TLS_REJECT_UNAUTHORIZED=0`) — diagnostic use only.

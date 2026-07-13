@@ -31,9 +31,11 @@ run_all() {
   echo "==================================================================="
   echo "[fingerprint]"; "$node" fingerprint.mjs
   echo "[crypto-aesgcm] (OpenSSL bulk AEAD, no network)"; "$node" crypto-aesgcm.mjs
-  echo "[loopback http keepalive] (stream/http path, no TLS)"; "$node" loopback.mjs --conns 8 --duration 5
-  echo "[loopback https keepalive] (TLS record crypto + stream)"; "$node" loopback.mjs --tls --cipher "$CIPHER" --conns 8 --duration 5
-  echo "[loopback https fresh] (per-request handshake cost)"; "$node" loopback.mjs --tls --cipher "$CIPHER" --conns 8 --duration 5 --fresh
+  echo "[loopback http  keepalive node]   (stream/http path, no TLS)"; "$node" loopback.mjs --conns 8 --duration 5 --gc-stats
+  echo "[loopback https keepalive node]   (TLS record crypto + stream)"; "$node" loopback.mjs --tls --cipher "$CIPHER" --conns 8 --duration 5 --gc-stats
+  echo "[loopback https fresh     node]   (per-request handshake cost)"; "$node" loopback.mjs --tls --cipher "$CIPHER" --conns 8 --duration 5 --fresh
+  echo "[loopback http  keepalive fetch]  (bundled-undici path, no TLS)"; "$node" loopback.mjs --client fetch --conns 8 --duration 5 --gc-stats
+  echo "[loopback https keepalive fetch]  (bundled-undici path, TLS)"; "$node" loopback.mjs --client fetch --tls --conns 8 --duration 5 --gc-stats
   if [[ "$S3" -eq 1 ]]; then
     echo "[s3-single node handler]";   "$node" s3-single.mjs --handler node
     echo "[s3-single undici handler]"; "$node" s3-single.mjs --handler undici
@@ -46,10 +48,13 @@ run_all "$NB"
 
 cat <<'EOF'
 How to read it:
-  - crypto-aesgcm regressed              -> bundled OpenSSL (bulk cipher)
-  - only https loopback regressed        -> TLS record crypto/OpenSSL, not JS
-  - http loopback ALSO regressed         -> V8 / stream / http-parser / GC / Buffer
-  - only "https fresh" regressed         -> TLS handshake/connect (OpenSSL)
-  - loopback fine but s3-single regressed-> network/DNS/handshake to S3, or SDK path
+  - crypto-aesgcm regressed                 -> bundled OpenSSL (bulk cipher)
+  - http loopback (node) regressed          -> V8 / core streams / Buffer / GC
+  - only https loopback (node) regressed    -> TLS record crypto/OpenSSL, not JS
+  - only "https fresh" regressed            -> TLS handshake/connect (OpenSSL)
+  - node http regressed but fetch did NOT   -> node core http/stream (not undici) -> try the undici handler
+  - fetch (undici) also regressed           -> bundled undici and/or shared net/stream layer
+  - GC% jumps on the slower version         -> GC-driven regression (V8) -> try --max-semi-space-size
+  - loopback fine but s3-single regressed   -> network/DNS/handshake to S3, or SDK path
 Compare the two version blocks line by line; the layer with the biggest gap is the cause.
 EOF
