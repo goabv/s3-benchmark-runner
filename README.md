@@ -388,7 +388,23 @@ git push
 Git tracking: only `results/runs/` is committed. Loose scratch output under
 `results/` (raw sweep JSON, ad-hoc CSV/SVG, the per-IP JSONL history) and all
 `*.bin` data are git-ignored, so the repo stays clean and you commit exactly the
-curated runs.
+curated runs. Runs **accumulate** — every captured run stays as its own timestamped
+folder, so the repo keeps your full history side by side.
+
+**Pruning runs you don't want** — `scripts/prune-runs.ps1` lists runs and removes
+selected ones from both the local repo and S3, then stages the deletion:
+
+```powershell
+.\scripts\prune-runs.ps1                       # list all runs
+.\scripts\prune-runs.ps1 20260713T101500-exp1  # remove one (by name)
+.\scripts\prune-runs.ps1 *exp1* 20260714T*     # globs / multiple patterns
+.\scripts\prune-runs.ps1 *old* -Force -Push    # skip prompt, commit + push
+```
+
+It keeps `README.md`/`.gitkeep` (only run directories match). Without `-Push` it
+just stages the removals so you can review, then `git commit && git push`. (Bash
+equivalent: `scripts/prune-runs.sh <glob> [--force] [--push]`.) Note this removes
+runs going forward; they remain in git *history* unless you rewrite it.
 
 First-time git setup:
 
