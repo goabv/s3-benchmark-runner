@@ -1,0 +1,12 @@
+node_modules/
+*.log
+.env
+
+# Large data / scratch artifacts never belong in git.
+*.bin
+
+# Benchmark results: COMMIT curated runs under results/runs/, but ignore the
+# scratch output the raw sweeps/tools drop directly in results/ (loose sweep JSON,
+# ad-hoc CSV/SVG, the per-IP JSONL history).
+results/*
+!results/runs/

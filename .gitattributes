@@ -1,0 +1,5 @@
+# Keep shell scripts LF so they run on Linux (EC2) even if cloned on Windows.
+*.sh text eol=lf
+
+# Normalize other text; let git pick line endings for the rest.
+* text=auto

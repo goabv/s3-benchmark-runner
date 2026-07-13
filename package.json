@@ -1,0 +1,24 @@
+{
+  "name": "s3-mpu-download-benchmark",
+  "version": "1.0.0",
+  "description": "Parallel ranged (multipart) S3 download benchmark for AWS SDK for JavaScript v3, using worker threads.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "s3dl-bench": "./src/benchmark.js"
+  },
+  "scripts": {
+    "bench": "node src/benchmark.js",
+    "bench:upload": "node src/upload-benchmark.js",
+    "seed": "node src/upload-test-data.js",
+    "test:ordered": "node test/ordered-backpressure.test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.658.0",
+    "@aws-sdk/lib-storage": "^3.658.0",
+    "@smithy/node-http-handler": "^3.2.4",
+    "@smithy/undici-http-handler": "^3.0.1"
+  }
+}
