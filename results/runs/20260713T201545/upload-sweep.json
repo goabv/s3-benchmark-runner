@@ -1,0 +1,95 @@
+{
+  "mode": "upload",
+  "sdkVersion": "3.1080.0",
+  "smithyCoreVersion": "3.29.2",
+  "config": {
+    "bucket": "s3dl-bench-usw2-801400661003",
+    "region": "us-west-2",
+    "prefix": "bench/",
+    "groups": [
+      {
+        "label": "30GiB",
+        "count": 10,
+        "keys": [
+          "bench/30gib-0.bin",
+          "bench/30gib-1.bin",
+          "bench/30gib-2.bin",
+          "bench/30gib-3.bin",
+          "bench/30gib-4.bin",
+          "bench/30gib-5.bin",
+          "bench/30gib-6.bin",
+          "bench/30gib-7.bin",
+          "bench/30gib-8.bin",
+          "bench/30gib-9.bin"
+        ]
+      }
+    ],
+    "partSize": 33554432,
+    "checksum": "CRC32",
+    "uploadSource": "memory",
+    "sourcePath": "/tmp",
+    "spreadConnections": false,
+    "tls": true,
+    "workers": 64,
+    "concurrency": 4,
+    "iterations": 1,
+    "warmup": 1,
+    "forceUpload": true,
+    "httpHandler": "undici",
+    "cipher": "default",
+    "ciphers": null,
+    "ipThroughput": false,
+    "ipThroughputSizes": [],
+    "ipThroughputFile": "results/ip-throughput.jsonl",
+    "json": false,
+    "out": "results/runs/20260713T201545/upload-sweep.json"
+  },
+  "results": [
+    {
+      "label": "30GiB",
+      "files": 10,
+      "perFileSize": 32212254720,
+      "size": 322122547200,
+      "parts": 9600,
+      "partSize": 33554432,
+      "checksum": "CRC32",
+      "uploadSource": "memory",
+      "workers": 64,
+      "concurrency": 4,
+      "totalInFlight": 256,
+      "iterations": 1,
+      "samples": [
+        {
+          "secs": 26.293278025000003,
+          "mibps": 11683.594556293441,
+          "gbps": 98.00909476367961
+        }
+      ],
+      "median": {
+        "secs": 26.293278025000003,
+        "mibps": 11683.594556293441,
+        "gbps": 98.00909476367961
+      },
+      "best": {
+        "secs": 26.293278025000003,
+        "mibps": 11683.594556293441,
+        "gbps": 98.00909476367961
+      },
+      "resources": {
+        "peakRssBytes": 19102945280,
+        "avgRssBytes": 14118132032,
+        "peakCpuPercent": 90.85895634618541,
+        "avgCpuPercent": 36.6675206923608,
+        "peakMemUtilPercent": 14.401200883104728,
+        "cpuCount": 64,
+        "totalMemBytes": 132648280064,
+        "samples": 320
+      },
+      "ipThroughput": null,
+      "tlsInfo": {
+        "protocol": "TLSv1.3",
+        "cipher": "TLS_AES_128_GCM_SHA256"
+      }
+    }
+  ]
+}
