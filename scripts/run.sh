@@ -65,20 +65,24 @@ cp bench.config.json "$DIR/config.json"
 OUT="$DIR/${MODE}-sweep.json"
 MARKER="$DIR/.start"; : > "$MARKER"
 
+# The formatted table + [info]/[done] lines (exactly what you see on the terminal)
+# are teed into summary.txt so each committed run is human-readable at a glance.
+SUMMARY="$DIR/summary.txt"
+
 case "$MODE" in
   download)
     echo ">> Seeding configured sizes (skipping existing) ..."
     node src/upload-test-data.js
     echo ">> DOWNLOAD sweep -> ${OUT}"
-    node src/benchmark.js --out "$OUT"
+    node src/benchmark.js --out "$OUT" 2>&1 | tee "$SUMMARY"
     ;;
   bench)
     echo ">> DOWNLOAD sweep (no seeding) -> ${OUT}"
-    node src/benchmark.js --out "$OUT"
+    node src/benchmark.js --out "$OUT" 2>&1 | tee "$SUMMARY"
     ;;
   upload)
     echo ">> UPLOAD sweep (forced) -> ${OUT}"
-    node src/upload-benchmark.js --force --out "$OUT"
+    node src/upload-benchmark.js --force --out "$OUT" 2>&1 | tee "$SUMMARY"
     ;;
   *)
     echo "unknown mode '${MODE}' (use download | bench | upload)" >&2

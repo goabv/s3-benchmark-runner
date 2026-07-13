@@ -1,0 +1,16 @@
+﻿
+=== S3 multipart UPLOAD benchmark (AWS SDK JS v3) ===
+sdk=@aws-sdk/client-s3@3.1080.0  @smithy/core@3.29.2
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003
+source=memory  handler=node  transport=HTTPS  part-size=32.00 MiB  checksum=CRC32  workers=64  concurrency=4  iterations=1 (warmup=1)
+
+size         files       total   parts  inflight   med MiB/s   med Gbps  best Gbps
+----------------------------------------------------------------------------------
+30GiB           10  300.00 GiB    9600       256     14706.1    123.364    123.364
+
+resource usage (whole process, during measured iterations):
+size            peak RSS     avg RSS  peak CPU   avg CPU  peak MEM
+------------------------------------------------------------------
+30GiB          12.22 GiB    8.15 GiB       99%       36%      9.9%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+

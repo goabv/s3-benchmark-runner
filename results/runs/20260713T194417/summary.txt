@@ -1,0 +1,18 @@
+﻿
+=== S3 part-boundary download benchmark (AWS SDK JS v3) ===
+sdk=@aws-sdk/client-s3@3.1080.0  @smithy/core@3.29.2
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003
+delivery=ordered-stream  handler=undici  transport=HTTPS  checksum=ON  spread-conns=ON  workers=64  concurrency=4  iterations=1 (warmup=1)
+
+size         files       total   parts  inflight   med MiB/s   med Gbps  best Gbps
+----------------------------------------------------------------------------------
+30GiB           10  300.00 GiB    9600       256     17199.1    144.277    144.277
+
+resource usage (whole process, during measured iterations):
+size            peak RSS     avg RSS  peak CPU   avg CPU  peak MEM
+------------------------------------------------------------------
+30GiB          27.07 GiB   24.36 GiB      100%       74%     21.9%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+
+per-part download time 30GiB (ms): p50=401.6  p90=576.3  p99=1527.6  p99.9=2033.2  max=2621.7  (n=9600)
+
