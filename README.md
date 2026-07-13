@@ -357,12 +357,16 @@ committable run under `results/runs/<timestamp>[-label]/` (config snapshot +
 environment + results + any CSV/SVG artifacts) and uploads it to S3:
 
 ```bash
-./scripts/run.sh download aes128-spread   # seed (if needed) + download sweep
+./scripts/run.sh                          # DEFAULT: seed + download sweep, then upload sweep
+./scripts/run.sh both aes128-spread       # same, with a label
+./scripts/run.sh download aes128-spread   # download sweep only (seeds first)
 ./scripts/run.sh bench    quick           # download sweep, skip seeding
-./scripts/run.sh upload   file-source     # forced upload sweep
+./scripts/run.sh upload   file-source     # forced upload sweep only
 ```
 
-The 2nd arg is an optional label to tell runs apart. See
+With the default `both` mode you get one run folder containing both
+`download-sweep.json` and `upload-sweep.json` (and a combined `summary.txt`). The
+2nd arg is an optional label to tell runs apart. See
 [`results/runs/README.md`](results/runs/README.md) for the directory layout.
 
 **2. On your dev box — pull and commit.** `pull-results.ps1` syncs the captured

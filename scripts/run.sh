@@ -4,21 +4,24 @@
 # pull it down and commit it from your dev machine.
 #
 # Each run directory contains:
-#   config.json        - exact bench.config.json used (snapshot)
-#   env.txt            - instance type, node/SDK versions, kernel, key sysctls
-#   <mode>-sweep.json  - the benchmark JSON results
-#   *.csv / *.svg      - any part-times / time-series artifacts produced
+#   config.json          - exact bench.config.json used (snapshot)
+#   env.txt              - instance type, node/SDK versions, kernel, key sysctls
+#   download-sweep.json  - download results (modes: both, download, bench)
+#   upload-sweep.json    - upload results   (modes: both, upload)
+#   summary.txt          - the formatted console output (throughput + resources)
+#   *.csv / *.svg        - any part-times / time-series artifacts produced
 #
 # Usage:
-#   ./scripts/run.sh download [label]     # seed (if needed) + download sweep
-#   ./scripts/run.sh upload   [label]     # upload sweep (forced)
+#   ./scripts/run.sh [both]   [label]     # DEFAULT: seed + download sweep, then upload sweep
+#   ./scripts/run.sh download [label]     # seed (if needed) + download sweep only
+#   ./scripts/run.sh upload   [label]     # upload sweep (forced) only
 #   ./scripts/run.sh bench    [label]     # download sweep WITHOUT seeding
 #
-# Example: ./scripts/run.sh download aes128-spread
+# Example: ./scripts/run.sh both aes128-spread
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MODE="${1:-download}"
+MODE="${1:-both}"
 LABEL="${2:-}"
 STAMP="$(date +%Y%m%dT%H%M%S)"
 NAME="${STAMP}${LABEL:+-${LABEL}}"
@@ -62,30 +65,25 @@ cp bench.config.json "$DIR/config.json"
   done
 } > "$DIR/env.txt"
 
-OUT="$DIR/${MODE}-sweep.json"
 MARKER="$DIR/.start"; : > "$MARKER"
 
 # The formatted table + [info]/[done] lines (exactly what you see on the terminal)
-# are teed into summary.txt so each committed run is human-readable at a glance.
-SUMMARY="$DIR/summary.txt"
+# are appended to summary.txt so each committed run is human-readable at a glance.
+SUMMARY="$DIR/summary.txt"; : > "$SUMMARY"
+
+do_seed()     { echo ">> Seeding configured sizes (skipping existing) ..."; node src/upload-test-data.js; }
+do_download() { echo ">> DOWNLOAD sweep -> $DIR/download-sweep.json"
+                node src/benchmark.js --out "$DIR/download-sweep.json" 2>&1 | tee -a "$SUMMARY"; }
+do_upload()   { echo ">> UPLOAD sweep (forced) -> $DIR/upload-sweep.json"
+                node src/upload-benchmark.js --force --out "$DIR/upload-sweep.json" 2>&1 | tee -a "$SUMMARY"; }
 
 case "$MODE" in
-  download)
-    echo ">> Seeding configured sizes (skipping existing) ..."
-    node src/upload-test-data.js
-    echo ">> DOWNLOAD sweep -> ${OUT}"
-    node src/benchmark.js --out "$OUT" 2>&1 | tee "$SUMMARY"
-    ;;
-  bench)
-    echo ">> DOWNLOAD sweep (no seeding) -> ${OUT}"
-    node src/benchmark.js --out "$OUT" 2>&1 | tee "$SUMMARY"
-    ;;
-  upload)
-    echo ">> UPLOAD sweep (forced) -> ${OUT}"
-    node src/upload-benchmark.js --force --out "$OUT" 2>&1 | tee "$SUMMARY"
-    ;;
+  both|all) do_seed; do_download; do_upload ;;
+  download) do_seed; do_download ;;
+  bench)    do_download ;;
+  upload)   do_upload ;;
   *)
-    echo "unknown mode '${MODE}' (use download | bench | upload)" >&2
+    echo "unknown mode '${MODE}' (use both | download | upload | bench)" >&2
     exit 1
     ;;
 esac
