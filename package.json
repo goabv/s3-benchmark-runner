@@ -1,7 +1,7 @@
 {
-  "name": "s3-mpu-download-benchmark",
+  "name": "s3-benchmark-runner",
   "version": "1.0.0",
-  "description": "Parallel ranged (multipart) S3 download benchmark for AWS SDK for JavaScript v3, using worker threads.",
+  "description": "Parallel S3 multipart (PartNumber) download and upload throughput benchmark for AWS SDK for JavaScript v3, using worker threads.",
   "type": "module",
   "engines": {
     "node": ">=18"
