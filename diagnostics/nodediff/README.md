@@ -14,6 +14,7 @@ The download path, bottom to top, and the probe that isolates each:
 | TLS handshake / connect | `loopback.mjs --tls --fresh` | Per-request new connection — isolates handshake cost |
 | Real S3 transport (SDK) | `s3-single.mjs` | One part, single connection, no workers — TTFB + streaming MiB/s |
 | Version fingerprint | `fingerprint.mjs` | node / v8 / openssl / uv / undici / llhttp versions |
+| **Where the CPU goes** | `loopback.mjs --prof` | CPU-profiles the measured window and prints the **top self-time functions** — diff two node versions to name the regressed function |
 
 ## Run it
 
@@ -60,6 +61,31 @@ culprit:
   (e.g. `NODE_OPTIONS=--max-semi-space-size=128`) to test.
 
 The runner exercises both node and fetch clients (with `--gc-stats`) automatically.
+
+- **CPU profiling** — `loopback.mjs --prof [--prof-top N]` profiles the measured
+  window and prints the top-N functions by self time. Run it under each node
+  version and diff the tables — the function whose self-time share grew is where
+  the regression lives:
+
+  ```bash
+  node loopback.mjs --conns 8 --duration 5 --prof            # node22
+  node loopback.mjs --conns 8 --duration 5 --prof            # node24, then diff
+  ```
+
+## Profiling the real benchmark
+
+The download hot path runs in the worker threads, so the benchmark profiles
+*there*: `node src/benchmark.js --profile` (or `"profile": true`) writes one
+`.cpuprofile` per worker to `results/profile-<nodeVersion>/` (per-version so runs
+don't clobber). Summarize/diff with:
+
+```bash
+node scripts/prof-top.mjs results/profile-v22.23.1/dl-worker-0.cpuprofile
+node scripts/prof-top.mjs results/profile-v24.18.0/dl-worker-0.cpuprofile
+```
+
+Use a **large** object (e.g. 30GiB) so the receive hot path dominates over
+worker-startup/module-load noise (the worker profile includes startup).
 
 ## Notes
 

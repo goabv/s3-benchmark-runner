@@ -237,6 +237,10 @@ Options (override bench.config.json):
   --file-async             (file mode) write each part asynchronously (threadpool)
                            so disk writes don't block the worker's event loop.
                            Consider raising UV_THREADPOOL_SIZE at high worker counts.
+  --profile                CPU-profile each download worker; writes one .cpuprofile
+                           per worker (default results/profile-<nodeVersion>/).
+                           Analyze/diff with: node scripts/prof-top.mjs <file>.
+  --profile-dir <dir>      Directory for the per-worker .cpuprofile files.
   --max-buffered <size>    ordered-stream reorder-buffer cap (default 2GiB). Pauses
                            new part downloads when exceeded; resumes below half.
   --buffer-pool            (ordered-stream) copy each part into a reused contiguous
@@ -290,7 +294,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     if (!a.startsWith('--')) continue;
     const key = a.slice(2);
     // Boolean flags.
-    if (['keep', 'json', 'help', 'no-checksum', 'log-connections', 'spread-connections', 'no-tls', 'ip-throughput', 'timeseries', 'part-times', 'buffer-pool', 'file-async'].includes(key)) {
+    if (['keep', 'json', 'help', 'no-checksum', 'log-connections', 'spread-connections', 'no-tls', 'ip-throughput', 'timeseries', 'part-times', 'buffer-pool', 'file-async', 'profile'].includes(key)) {
       args[key] = true;
       continue;
     }
@@ -381,6 +385,11 @@ export function parseArgs(argv = process.argv.slice(2)) {
     // file mode: write each part asynchronously (libuv threadpool) so disk-write
     // latency doesn't block the worker's event loop / socket draining.
     fileAsync: Boolean(args['file-async'] || pick('fileAsync')),
+    // Diagnostics: CPU-profile each download worker and write a .cpuprofile per
+    // worker. Default dir is per-node-version so runs under different nodes don't
+    // clobber each other. Analyze with scripts/prof-top.mjs.
+    profile: Boolean(args.profile || pick('profile')),
+    profileDir: args['profile-dir'] ?? pick('profileDir') ?? `results/profile-${process.version}`,
     ...ipThroughputOpts(args, pick),
     json: Boolean(args.json),
     out: args.out ?? null,

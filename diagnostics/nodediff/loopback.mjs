@@ -36,6 +36,8 @@ const DURATION = Number(arg('duration', 5));
 const CIPHER = arg('cipher', null);
 const CLIENT = arg('client', 'node'); // node (core http/https) | fetch (bundled undici)
 const GC = has('gc-stats');
+const PROF = has('prof');                     // CPU-profile the measured window
+const PROF_TOP = Number(arg('prof-top', 25)); // how many hot functions to print
 
 // Bundled undici (global fetch) rejects self-signed certs; for the loopback cert
 // disable verification for this diagnostic process only.
@@ -123,11 +125,28 @@ if (CLIENT === 'fetch') {
 }
 async function lane() { while (!stop) { try { await one(); } catch (e) { if (!stop) throw e; break; } } }
 
+// Optional CPU profiling of the measured window (find the regressed function).
+let session = null;
+if (PROF) {
+  const { Session } = await import('node:inspector/promises');
+  session = new Session();
+  session.connect();
+  await session.post('Profiler.enable');
+  await session.post('Profiler.setSamplingInterval', { interval: 250 }); // microseconds
+  await session.post('Profiler.start');
+}
+
 const t0 = performance.now();
 const timer = setTimeout(() => { stop = true; }, DURATION * 1000);
 timer.unref?.();
 await Promise.all(Array.from({ length: CONNS }, lane));
 const secs = (performance.now() - t0) / 1000;
+
+let profile = null;
+if (session) {
+  ({ profile } = await session.post('Profiler.stop'));
+  session.disconnect();
+}
 server.close();
 if (agent) agent.destroy();
 
@@ -140,3 +159,8 @@ if (GC) {
   line += `\tGC: ${gcCount} events, ${gcTotal.toFixed(0)} ms total (${((gcTotal / (secs * 1000)) * 100).toFixed(1)}% wall), max ${gcMax.toFixed(1)} ms`;
 }
 console.log(line);
+
+if (profile) {
+  const { printTop } = await import('./proftop.mjs');
+  printTop(profile, PROF_TOP, `${mode} ${process.version}`);
+}

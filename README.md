@@ -850,6 +850,8 @@ node src/upload-test-data.js --help   # seed
 | `--ip-throughput` | `ipThroughput` | Record per-IP throughput for every size |
 | `--ip-throughput-sizes <s1,..>` | `ipThroughputSizes` | Record per-IP throughput for these sizes |
 | `--ip-throughput-file <f>` | `ipThroughputFile` | JSONL history file |
+| `--profile` | `profile` | CPU-profile each worker → one `.cpuprofile` per worker |
+| `--profile-dir <dir>` | `profileDir` | Dir for the profiles (default `results/profile-<node>/`) |
 | `--json` | — | Emit JSON results to stdout |
 | `--out <file>` | — | Also write JSON results to a file |
 

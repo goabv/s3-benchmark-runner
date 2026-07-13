@@ -1,5 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { openSync, writevSync, writev as writevCb, closeSync } from 'node:fs';
+import { openSync, writevSync, writev as writevCb, closeSync, writeFileSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { Readable } from 'node:stream';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
@@ -50,7 +50,34 @@ const {
   workerId = 0, // index of this worker, used to make connection ids globally unique
   bufferPool, // ordered-stream: copy chunks into reused contiguous part buffers
   fileAsync, // file mode: write each part asynchronously (don't block the event loop)
+  profile, // when true, CPU-profile this worker and write a .cpuprofile
+  profileDir, // directory for the per-worker .cpuprofile files
 } = workerData;
+
+// Optional per-worker CPU profiler (find where a worker spends its time — e.g. to
+// diff a node-version regression). Started before 'ready' so setup is included but
+// timing isn't affected; stopped + written when the worker finishes.
+let profSession = null;
+if (profile) {
+  const inspector = await import('node:inspector/promises');
+  profSession = new inspector.Session();
+  profSession.connect();
+  await profSession.post('Profiler.enable');
+  await profSession.post('Profiler.setSamplingInterval', { interval: 250 });
+  await profSession.post('Profiler.start');
+}
+async function stopProfile() {
+  if (!profSession) return;
+  const s = profSession;
+  profSession = null;
+  try {
+    const { profile: p } = await s.post('Profiler.stop');
+    s.disconnect();
+    writeFileSync(`${profileDir}/dl-worker-${workerId}.cpuprofile`, JSON.stringify(p));
+  } catch {
+    /* ignore profiling errors */
+  }
+}
 
 const STALL_MS = Number(stallTimeoutMs) > 0 ? Number(stallTimeoutMs) : 0;
 const MAX_PART_RETRIES = Number.isFinite(Number(partRetries)) ? Number(partRetries) : 3;
@@ -316,8 +343,11 @@ let dispatchStopped = false;
 let dPartsDone = 0;
 let dChecksummed = 0;
 
-function dispatchMaybeDone() {
-  if (dispatchStopped && dispatchInFlight === 0) {
+let doneEmitted = false;
+async function dispatchMaybeDone() {
+  if (dispatchStopped && dispatchInFlight === 0 && !doneEmitted) {
+    doneEmitted = true;
+    await stopProfile();
     const ipTput = tracker ? tracker.snapshot() : null;
     parentPort.postMessage({
       type: 'worker-done',
@@ -401,6 +431,7 @@ if (deliveryMode === 'ordered-stream') {
     if (msg?.type !== 'start') return;
     try {
       const { totalBytes, partsDone, checksummed, elapsedMs, partTimings } = await runSlice();
+      await stopProfile();
       const ipTput = tracker ? tracker.snapshot() : null;
       parentPort.postMessage({
         type: 'done',

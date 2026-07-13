@@ -94,7 +94,7 @@ async function describeObject(client, bucket, key) {
  * `ready`, then broadcast `start` and time until the last `done`.
  */
 // SLICE mode (discard / file): each worker owns a fixed slice and runs freely.
-function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets, validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler, ciphers, stallTimeoutMs, partRetries, partTimes, fileAsync }) {
+function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets, validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler, ciphers, stallTimeoutMs, partRetries, partTimes, fileAsync, profile, profileDir }) {
   const buckets = assignParts(parts, workers).filter((b) => b.length > 0);
   const active = buckets.length;
 
@@ -128,6 +128,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
           bucket, region, parts: slice, concurrency, keep, maxSockets,
           validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler,
           ciphers, stallTimeoutMs, partRetries, partTimes, workerId: sliceIdx++, fileAsync,
+          profile, profileDir,
         },
       });
       threads.push(worker);
@@ -178,7 +179,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
  * dispatches the next part regardless of the cap (bounded one-part overshoot),
  * so the part delivery is waiting on is always fetched.
  */
-function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, validateChecksum, logConnections, spreadConnections, tls, ipThroughput, maxBufferedBytes, httpHandler, ciphers, timeseries, stallTimeoutMs, partRetries, partTimes, bufferPool }) {
+function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, validateChecksum, logConnections, spreadConnections, tls, ipThroughput, maxBufferedBytes, httpHandler, ciphers, timeseries, stallTimeoutMs, partRetries, partTimes, bufferPool, profile, profileDir }) {
   const queue = [...parts].sort(
     (a, b) => a.partNumber - b.partNumber || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
   );
@@ -315,6 +316,7 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
           bucket, region, parts: [], concurrency, maxSockets, validateChecksum,
           deliveryMode: 'ordered-stream', logConnections, spreadConnections, tls, ipThroughput, httpHandler,
           ciphers, stallTimeoutMs, partRetries, partTimes, workerId: wi, bufferPool,
+          profile, profileDir,
         },
       });
       threads.push(worker);
@@ -574,7 +576,10 @@ async function benchmarkGroup(cfg, group) {
     timeseries: cfg.timeseries && cfg.deliveryMode === 'ordered-stream',
     // Buffer pool is an ordered-stream-only memory strategy.
     bufferPool: cfg.bufferPool && cfg.deliveryMode === 'ordered-stream',
+    profile: cfg.profile,
+    profileDir: cfg.profileDir,
   };
+  if (cfg.profile) mkdirSync(cfg.profileDir, { recursive: true });
 
   const doRun = () => (cfg.deliveryMode === 'ordered-stream' ? runOrdered(runCfg) : runOnce(runCfg));
 
@@ -853,6 +858,14 @@ async function main() {
     process.stdout.write(payload + '\n');
   } else {
     printHuman(cfg, all);
+  }
+
+  if (cfg.profile) {
+    console.error(
+      `[profile] wrote per-worker .cpuprofile files to ${cfg.profileDir}\n` +
+        `  analyze:  node scripts/prof-top.mjs ${cfg.profileDir}/dl-worker-0.cpuprofile\n` +
+        `  (run under each node version — dirs are per-version — then diff the top tables)`,
+    );
   }
 }
 
