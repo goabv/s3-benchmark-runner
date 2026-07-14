@@ -9,6 +9,7 @@ The download path, bottom to top, and the probe that isolates each:
 | Layer | Probe | What it measures |
 |-------|-------|------------------|
 | Bulk AEAD crypto (OpenSSL) | `crypto-aesgcm.mjs` | AES-128/256-GCM + ChaCha20 encrypt/decrypt MB/s — no network, no streams |
+| **Pure-JS CRC32 loop** | `crc32-js.mjs` | The SDK's checksum-validation hot loop in isolation — MB/s; bisect with V8 flags |
 | TLS record crypto + stream | `loopback.mjs --tls` | HTTPS receive throughput over loopback (TLS decrypt + HTTP parse + stream drain) |
 | Plain stream / http / GC | `loopback.mjs` | Same over plain HTTP (no TLS) — isolates V8 / stream / parser / Buffer / GC |
 | TLS handshake / connect | `loopback.mjs --tls --fresh` | Per-request new connection — isolates handshake cost |
@@ -31,6 +32,25 @@ chmod +x run.sh
 
 `run.sh` pins the HTTPS probe to `TLS_AES_128_GCM_SHA256` so both versions negotiate
 the same cipher (a different default would confound the result).
+
+## Why is checksum validation slower on Node 24? (`crc32-js.mjs`)
+
+The download regression is dominated by the SDK's **pure-JS CRC32** checksum loop
+(no hardware/native CRC — the SDK computes it in JavaScript). `crc32-js.mjs`
+isolates that loop (no network/streams) so you can attribute the slowdown to V8
+codegen and bisect it:
+
+```bash
+nvm use 22 && node crc32-js.mjs                 # baseline
+nvm use 24 && node crc32-js.mjs                 # is it slower?
+nvm use 24 && node --no-maglev crc32-js.mjs     # if this recovers -> Maglev codegen
+nvm use 24 && node --trace-deopt crc32-js.mjs   # any deopt churn?
+nvm use 24 && node --trace-opt   crc32-js.mjs   # which tier the loop reaches
+```
+
+If `--no-maglev` recovers Node 22-like MB/s, the culprit is V8 13.6's Maglev
+mid-tier generating slower code for this loop — a specific, upstream-reportable
+finding.
 
 ## Interpreting the diff
 
