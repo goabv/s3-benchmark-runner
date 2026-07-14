@@ -9,6 +9,7 @@ import { GetObjectCommand } from '@aws-sdk/client-s3';
 const writevAsync = promisify(writevCb);
 import { makeClient } from './s3.js';
 import { IpThroughputTracker } from './ip-throughput.js';
+import { installNativeCrc32 } from './crc32-native.mjs';
 
 /**
  * Worker thread: downloads parts by PartNumber. Each part carries its own object
@@ -52,7 +53,14 @@ const {
   fileAsync, // file mode: write each part asynchronously (don't block the event loop)
   profile, // when true, CPU-profile this worker and write a .cpuprofile
   profileDir, // directory for the per-worker .cpuprofile files
+  nativeCrc32, // patch @aws-crypto/crc32 to use native zlib.crc32
 } = workerData;
+
+// Apply the SDK-layer CRC32 patch before any request creates a checksum instance.
+if (nativeCrc32) {
+  const r = installNativeCrc32();
+  if (!r.patched) console.error(`[native-crc32] not applied: ${r.reason}`);
+}
 
 // Optional per-worker CPU profiler (find where a worker spends its time — e.g. to
 // diff a node-version regression). Started before 'ready' so setup is included but

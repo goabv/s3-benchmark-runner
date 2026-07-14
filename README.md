@@ -662,6 +662,26 @@ for both download and upload; works on the `node` and `undici` handlers. To meas
 the cipher's effect, A/B `cipher: "aes128"` vs `cipher: "aes256"` and compare
 throughput and avg CPU.
 
+## Native CRC32 checksum (`nativeCrc32`)
+
+The SDK validates CRC32 with `@aws-crypto/crc32`, a **pure-JS** loop (`for..of` over
+the bytes + `this.checksum` field mutation) — measured ~5–9× slower than an
+optimal loop, and a big share of download CPU when checksum validation is on.
+`nativeCrc32` (or `--native-crc32`) monkey-patches that class at the **SDK layer**
+(`src/crc32-native.mjs`) to use Node's native, hardware-accelerated `zlib.crc32`
+instead, so every SDK GET/PUT that computes a CRC32 benefits — no call-site changes.
+
+```json
+"nativeCrc32": true
+```
+
+Safety: it only applies when `zlib.crc32` exists (Node ≥ 18) **and** a runtime
+self-test confirms it produces byte-identical results (single-shot + streaming) to
+the implementation it replaces — otherwise it's a no-op and logs why. It covers
+**CRC32 only** (zlib has no CRC32C); with CRC32C it's a no-op. Keeps full checksum
+validation, just computed natively — the recommended way to keep integrity checks
+without the slow JS loop (and it sidesteps the Node 24 per-chunk amplification).
+
 ## Network tuning on the EC2 box (`scripts/tune-network.sh`)
 
 Per-connection throughput ramps over the first few round-trips (TCP slow-start),
@@ -850,6 +870,7 @@ node src/upload-test-data.js --help   # seed
 | `--ip-throughput` | `ipThroughput` | Record per-IP throughput for every size |
 | `--ip-throughput-sizes <s1,..>` | `ipThroughputSizes` | Record per-IP throughput for these sizes |
 | `--ip-throughput-file <f>` | `ipThroughputFile` | JSONL history file |
+| `--native-crc32` | `nativeCrc32` | Patch `@aws-crypto/crc32` to use native `zlib.crc32` (CRC32 only) |
 | `--profile` | `profile` | CPU-profile each worker → one `.cpuprofile` per worker |
 | `--profile-dir <dir>` | `profileDir` | Dir for the profiles (default `results/profile-<node>/`) |
 | `--json` | — | Emit JSON results to stdout |

@@ -78,6 +78,11 @@ async function main() {
       '--warmup', '0',
       '--workers', '4',
       '--concurrency', '4',
+      // Pin settings so the test is deterministic regardless of bench.config.json.
+      // This exercises the main-thread dispatch/backpressure logic on the node
+      // handler; the undici handler is A/B'd separately.
+      '--handler', 'node',
+      '--stall-timeout', '0',
     ],
     { BENCH_SLOW_PART: '1', BENCH_SLOW_MS: String(SLOW_MS) },
   );

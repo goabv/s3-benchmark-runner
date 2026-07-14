@@ -94,7 +94,7 @@ async function describeObject(client, bucket, key) {
  * `ready`, then broadcast `start` and time until the last `done`.
  */
 // SLICE mode (discard / file): each worker owns a fixed slice and runs freely.
-function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets, validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler, ciphers, stallTimeoutMs, partRetries, partTimes, fileAsync, profile, profileDir }) {
+function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets, validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler, ciphers, stallTimeoutMs, partRetries, partTimes, fileAsync, profile, profileDir, nativeCrc32 }) {
   const buckets = assignParts(parts, workers).filter((b) => b.length > 0);
   const active = buckets.length;
 
@@ -128,7 +128,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
           bucket, region, parts: slice, concurrency, keep, maxSockets,
           validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler,
           ciphers, stallTimeoutMs, partRetries, partTimes, workerId: sliceIdx++, fileAsync,
-          profile, profileDir,
+          profile, profileDir, nativeCrc32,
         },
       });
       threads.push(worker);
@@ -179,7 +179,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
  * dispatches the next part regardless of the cap (bounded one-part overshoot),
  * so the part delivery is waiting on is always fetched.
  */
-function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, validateChecksum, logConnections, spreadConnections, tls, ipThroughput, maxBufferedBytes, httpHandler, ciphers, timeseries, stallTimeoutMs, partRetries, partTimes, bufferPool, profile, profileDir }) {
+function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, validateChecksum, logConnections, spreadConnections, tls, ipThroughput, maxBufferedBytes, httpHandler, ciphers, timeseries, stallTimeoutMs, partRetries, partTimes, bufferPool, profile, profileDir, nativeCrc32 }) {
   const queue = [...parts].sort(
     (a, b) => a.partNumber - b.partNumber || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
   );
@@ -316,7 +316,7 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
           bucket, region, parts: [], concurrency, maxSockets, validateChecksum,
           deliveryMode: 'ordered-stream', logConnections, spreadConnections, tls, ipThroughput, httpHandler,
           ciphers, stallTimeoutMs, partRetries, partTimes, workerId: wi, bufferPool,
-          profile, profileDir,
+          profile, profileDir, nativeCrc32,
         },
       });
       threads.push(worker);
@@ -571,6 +571,7 @@ async function benchmarkGroup(cfg, group) {
     partRetries: cfg.partRetries,
     partTimes: cfg.partTimes,
     fileAsync: cfg.fileAsync,
+    nativeCrc32: cfg.nativeCrc32,
     // Time series only makes sense for ordered-stream (buffered/in-flight counts
     // are centrally tracked there); ignored by runOnce.
     timeseries: cfg.timeseries && cfg.deliveryMode === 'ordered-stream',

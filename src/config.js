@@ -241,6 +241,9 @@ Options (override bench.config.json):
                            per worker (default results/profile-<nodeVersion>/).
                            Analyze/diff with: node scripts/prof-top.mjs <file>.
   --profile-dir <dir>      Directory for the per-worker .cpuprofile files.
+  --native-crc32           Patch @aws-crypto/crc32 (the SDK's checksum lib) to use
+                           native zlib.crc32 instead of its pure-JS loop. Applies
+                           to CRC32 only; verified via runtime self-test.
   --max-buffered <size>    ordered-stream reorder-buffer cap (default 2GiB). Pauses
                            new part downloads when exceeded; resumes below half.
   --buffer-pool            (ordered-stream) copy each part into a reused contiguous
@@ -294,7 +297,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     if (!a.startsWith('--')) continue;
     const key = a.slice(2);
     // Boolean flags.
-    if (['keep', 'json', 'help', 'no-checksum', 'log-connections', 'spread-connections', 'no-tls', 'ip-throughput', 'timeseries', 'part-times', 'buffer-pool', 'file-async', 'profile'].includes(key)) {
+    if (['keep', 'json', 'help', 'no-checksum', 'log-connections', 'spread-connections', 'no-tls', 'ip-throughput', 'timeseries', 'part-times', 'buffer-pool', 'file-async', 'profile', 'native-crc32'].includes(key)) {
       args[key] = true;
       continue;
     }
@@ -390,6 +393,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
     // clobber each other. Analyze with scripts/prof-top.mjs.
     profile: Boolean(args.profile || pick('profile')),
     profileDir: args['profile-dir'] ?? pick('profileDir') ?? `results/profile-${process.version}`,
+    // SDK-layer patch: use native zlib.crc32 instead of @aws-crypto/crc32's JS loop.
+    nativeCrc32: Boolean(args['native-crc32'] || pick('nativeCrc32')),
     ...ipThroughputOpts(args, pick),
     json: Boolean(args.json),
     out: args.out ?? null,
@@ -450,7 +455,7 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     const a = argv[i];
     if (!a.startsWith('--')) continue;
     const key = a.slice(2);
-    if (['force', 'json', 'help', 'spread-connections', 'no-tls', 'ip-throughput'].includes(key)) {
+    if (['force', 'json', 'help', 'spread-connections', 'no-tls', 'ip-throughput', 'native-crc32'].includes(key)) {
       args[key] = true;
       continue;
     }
@@ -504,6 +509,7 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     // Pin the TLS cipher suite (aes128 | aes256 | chacha20 | default | raw string).
     cipher: args.cipher ?? pick('cipher') ?? 'default',
     ciphers: resolveCiphers(args.cipher ?? pick('cipher')),
+    nativeCrc32: Boolean(args['native-crc32'] || pick('nativeCrc32')),
     ...ipThroughputOpts(args, pick),
     json: Boolean(args.json),
     out: args.out ?? null,

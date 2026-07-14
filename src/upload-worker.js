@@ -4,6 +4,7 @@ import { openSync, readSync, closeSync } from 'node:fs';
 import { UploadPartCommand } from '@aws-sdk/client-s3';
 import { makeClient } from './s3.js';
 import { IpThroughputTracker } from './ip-throughput.js';
+import { installNativeCrc32 } from './crc32-native.mjs';
 
 /**
  * Worker thread: uploads an assigned set of parts of a single in-progress
@@ -40,7 +41,13 @@ const {
   ipThroughput,
   httpHandler,
   ciphers, // OpenSSL cipher string to pin the TLS suite (null = defaults)
+  nativeCrc32, // patch @aws-crypto/crc32 to use native zlib.crc32
 } = workerData;
+
+if (nativeCrc32) {
+  const r = installNativeCrc32();
+  if (!r.patched) console.error(`[native-crc32] not applied: ${r.reason}`);
+}
 
 const tracker = ipThroughput ? new IpThroughputTracker((s) => s.bytesWritten) : null;
 const onConnect = tracker ? (ip, socket) => tracker.register(socket, ip) : null;

@@ -79,7 +79,7 @@ function completedPart(r) {
  * Excludes worker spawn + client init + data generation (ready/start handshake),
  * so it measures only the parallel UploadPart data transfer.
  */
-function runOnce({ bucket, region, parts, workers, concurrency, checksum, maxSockets, uploadSource, sourceFilePath, spreadConnections, tls, ipThroughput, httpHandler, ciphers }) {
+function runOnce({ bucket, region, parts, workers, concurrency, checksum, maxSockets, uploadSource, sourceFilePath, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32 }) {
   const buckets = assignParts(parts, workers).filter((b) => b.length > 0);
   const active = buckets.length;
 
@@ -105,7 +105,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, checksum, maxSoc
       const worker = new Worker(WORKER_PATH, {
         workerData: {
           bucket, region, parts: slice, concurrency, checksum, maxSockets,
-          uploadSource, sourceFilePath, spreadConnections, tls, ipThroughput, httpHandler, ciphers,
+          uploadSource, sourceFilePath, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32,
         },
       });
       threads.push(worker);
@@ -213,6 +213,7 @@ async function uploadIterationGroup(control, cfg, keys, baseParts, maxSockets, s
       ipThroughput: ipTputEnabled,
       httpHandler: cfg.httpHandler,
       ciphers: cfg.ciphers,
+      nativeCrc32: cfg.nativeCrc32,
     });
   } catch (err) {
     await abortAll();
