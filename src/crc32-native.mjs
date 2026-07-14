@@ -22,8 +22,21 @@ export function installNativeCrc32() {
 
   if (typeof zlib.crc32 !== 'function') return { patched: false, reason: 'zlib.crc32 unavailable (Node < 18)' };
 
-  let mod;
-  try { mod = require('@aws-crypto/crc32'); } catch { return { patched: false, reason: '@aws-crypto/crc32 not resolvable' }; }
+  // Resolve @aws-crypto/crc32 even if it's nested under the SDK's node_modules
+  // (npm doesn't always hoist it). Try a bare require first, then anchor the
+  // resolution at the SDK packages that depend on it.
+  let mod = null;
+  const tried = [];
+  const tryReq = (req, spec) => { try { return req(spec); } catch (e) { tried.push(`${spec}: ${e.code || e.message}`); return null; } };
+  mod = tryReq(require, '@aws-crypto/crc32');
+  for (const anchor of ['@aws-sdk/middleware-flexible-checksums', '@aws-sdk/client-s3']) {
+    if (mod) break;
+    try {
+      const anchorReq = createRequire(require.resolve(anchor));
+      mod = tryReq(anchorReq, '@aws-crypto/crc32');
+    } catch (e) { tried.push(`anchor ${anchor}: ${e.code || e.message}`); }
+  }
+  if (!mod) return { patched: false, reason: `@aws-crypto/crc32 not resolvable (${tried.join('; ')})` };
   const Crc32 = mod?.Crc32;
   if (!Crc32 || !Crc32.prototype || typeof Crc32.prototype.update !== 'function') {
     return { patched: false, reason: 'Crc32 not exported as expected' };
