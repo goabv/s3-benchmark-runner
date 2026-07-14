@@ -56,10 +56,13 @@ const {
   nativeCrc32, // patch @aws-crypto/crc32 to use native zlib.crc32
 } = workerData;
 
-// Apply the SDK-layer CRC32 patch before any request creates a checksum instance.
+// Confirm (or, for older SDKs, force) native zlib.crc32 for CRC32 before any
+// request creates a checksum instance.
 if (nativeCrc32) {
-  const r = installNativeCrc32();
-  if (!r.patched) console.error(`[native-crc32] not applied: ${r.reason}`);
+  const r = await installNativeCrc32();
+  if (r.patched) console.error(`[native-crc32] patched: ${r.reason}`);
+  else if (r.alreadyNative) console.error(`[native-crc32] no patch needed: ${r.reason}`);
+  else console.error(`[native-crc32] not applied: ${r.reason}`);
 }
 
 // Optional per-worker CPU profiler (find where a worker spends its time — e.g. to

@@ -241,9 +241,10 @@ Options (override bench.config.json):
                            per worker (default results/profile-<nodeVersion>/).
                            Analyze/diff with: node scripts/prof-top.mjs <file>.
   --profile-dir <dir>      Directory for the per-worker .cpuprofile files.
-  --native-crc32           Patch @aws-crypto/crc32 (the SDK's checksum lib) to use
-                           native zlib.crc32 instead of its pure-JS loop. Applies
-                           to CRC32 only; verified via runtime self-test.
+  --native-crc32           Ensure CRC32 uses native zlib.crc32. Modern SDKs
+                           (@smithy/core >= ~3.x on Node >= 22.2) already do this,
+                           so this just confirms it; on older SDKs it patches the
+                           pure-JS @aws-crypto/crc32 loop (verified byte-identical).
   --max-buffered <size>    ordered-stream reorder-buffer cap (default 2GiB). Pauses
                            new part downloads when exceeded; resumes below half.
   --buffer-pool            (ordered-stream) copy each part into a reused contiguous

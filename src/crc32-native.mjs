@@ -1,49 +1,93 @@
-// SDK-layer patch: replace @aws-crypto/crc32's pure-JS CRC32 (a `for..of` +
-// instance-field loop, several× slower than it needs to be, and heavier still on
-// Node 24) with Node's native, hardware-accelerated `zlib.crc32`.
+// SDK-layer CRC32 native check/patch.
 //
-// This monkey-patches the `Crc32` class the SDK actually uses (via `AwsCrc32` in
-// @aws-sdk/middleware-flexible-checksums), so every SDK GET/PUT that validates or
-// computes a CRC32 benefits — no change to call sites. Only applies when
-// `zlib.crc32` exists (Node >= 18) AND a runtime self-test confirms it produces
-// identical results to the implementation it's replacing. Idempotent.
+// Goal: make the SDK compute CRC32 with Node's native, hardware-accelerated
+// `zlib.crc32` instead of a pure-JS byte loop.
 //
-// Note: covers CRC32 only (zlib has no CRC32C). If the object uses CRC32C, this is
-// a no-op and the SDK's JS crc32c path is used unchanged.
+// Reality for the SDK version this project pins (@smithy/core 3.29.2, which the
+// AWS SDK v3 client uses via @aws-sdk/checksums): the SDK ALREADY does this. The
+// CRC32 the checksum middleware uses resolves like so:
+//
+//   selectChecksumAlgorithmFunction
+//     -> Crc32 from "@aws-sdk/checksums/crc"
+//       -> Crc32 (= Crc32Node) from "@smithy/core/checksum"
+//         -> Crc32Node = (typeof zlib.crc32 === 'function')
+//              ? buildNativeClass(zlib.crc32)   // native, hardware-accelerated
+//              : Crc32Js                         // pure-JS table loop fallback
+//
+// `zlib.crc32` exists on Node >= 22.2 (and >= 18 lines that backported it), so on
+// the EC2 node versions here (22.23 / 24.18) the SDK is native out of the box.
+//
+// So this module's job is now mostly to CONFIRM that (and say so), and only fall
+// back to monkey-patching for older SDKs that still ship the slow pure-JS
+// `@aws-crypto/crc32` (a `for..of` + instance-field loop). Resolution is done with
+// ESM `import()` so we inspect/patch the SAME module copy the ESM workers use
+// (CJS `require` would resolve a different dist-cjs copy).
+//
+// CRC32 only. Returns:
+//   { patched: true }                              -> legacy JS impl replaced
+//   { patched: false, alreadyNative: true, ... }   -> SDK already native (the norm)
+//   { patched: false, reason }                     -> nothing applicable
 import zlib from 'node:zlib';
-import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
 let done = false;
+let cached = null;
 
-export function installNativeCrc32() {
-  if (done) return { patched: false, reason: 'already run' };
+export async function installNativeCrc32() {
+  if (done) return cached;
   done = true;
 
-  if (typeof zlib.crc32 !== 'function') return { patched: false, reason: 'zlib.crc32 unavailable (Node < 18)' };
+  if (typeof zlib.crc32 !== 'function') {
+    return (cached = { patched: false, reason: 'zlib.crc32 unavailable (Node < 18/22.2)' });
+  }
 
-  // Resolve @aws-crypto/crc32 even if it's nested under the SDK's node_modules
-  // (npm doesn't always hoist it). Try a bare require first, then anchor the
-  // resolution at the SDK packages that depend on it.
-  let mod = null;
+  // 1) Modern SDK: inspect the checksum module the middleware actually imports.
+  //    These export Crc32 (the active class), Crc32Node (native) and Crc32Js
+  //    (pure-JS), so we can tell exactly which one is live by identity.
   const tried = [];
-  const tryReq = (req, spec) => { try { return req(spec); } catch (e) { tried.push(`${spec}: ${e.code || e.message}`); return null; } };
-  mod = tryReq(require, '@aws-crypto/crc32');
-  for (const anchor of ['@aws-sdk/middleware-flexible-checksums', '@aws-sdk/client-s3']) {
-    if (mod) break;
+  for (const spec of ['@aws-sdk/checksums/crc', '@smithy/core/checksum']) {
+    let mod;
     try {
-      const anchorReq = createRequire(require.resolve(anchor));
-      mod = tryReq(anchorReq, '@aws-crypto/crc32');
-    } catch (e) { tried.push(`anchor ${anchor}: ${e.code || e.message}`); }
-  }
-  if (!mod) return { patched: false, reason: `@aws-crypto/crc32 not resolvable (${tried.join('; ')})` };
-  const Crc32 = mod?.Crc32;
-  if (!Crc32 || !Crc32.prototype || typeof Crc32.prototype.update !== 'function') {
-    return { patched: false, reason: 'Crc32 not exported as expected' };
+      mod = await import(spec);
+    } catch (e) {
+      tried.push(`${spec}: ${e.code || e.message}`);
+      continue;
+    }
+    const { Crc32, Crc32Node, Crc32Js } = mod;
+    if (!Crc32) {
+      tried.push(`${spec}: no Crc32 export`);
+      continue;
+    }
+    const hasNative = Crc32Node && Crc32Js && Crc32Node !== Crc32Js;
+    if (hasNative && Crc32 === Crc32Node) {
+      return (cached = {
+        patched: false,
+        alreadyNative: true,
+        reason: `SDK already uses native zlib.crc32 (Crc32Node via ${spec})`,
+      });
+    }
+    // Native exists in the package but the active Crc32 isn't it (unusual). Nothing
+    // to do — reassigning an ESM binding isn't possible and the JS fallback here is
+    // already the fast indexed-table loop, not the slow @aws-crypto for..of.
+    return (cached = {
+      patched: false,
+      reason: `active Crc32 is not the native class (via ${spec}); JS fallback in use`,
+    });
   }
 
-  // Self-test against the ORIGINAL implementation (single-shot + streaming) before
-  // replacing it — never apply a patch that would change checksum results.
+  // 2) Legacy SDK: still on the slow pure-JS @aws-crypto/crc32. Monkey-patch its
+  //    prototype to use zlib.crc32, but only if a self-test proves byte-identical.
+  let legacy;
+  try {
+    legacy = await import('@aws-crypto/crc32');
+  } catch (e) {
+    tried.push(`@aws-crypto/crc32: ${e.code || e.message}`);
+    return (cached = { patched: false, reason: `no CRC32 module resolvable (${tried.join('; ')})` });
+  }
+  const Crc32 = legacy?.Crc32 ?? legacy?.default?.Crc32;
+  if (!Crc32?.prototype || typeof Crc32.prototype.update !== 'function') {
+    return (cached = { patched: false, reason: '@aws-crypto/crc32 Crc32 not exported as expected' });
+  }
+
   const a = Buffer.from('The quick brown fox');
   const b = Buffer.from(' jumps 0123456789\x00\xff');
   const origWhole = new Crc32().update(Buffer.concat([a, b])).digest() >>> 0;
@@ -51,11 +95,9 @@ export function installNativeCrc32() {
   const nativeWhole = zlib.crc32(Buffer.concat([a, b]), 0) >>> 0;
   const nativeStream = zlib.crc32(b, zlib.crc32(a, 0)) >>> 0;
   if (origWhole !== nativeWhole || origStream !== nativeStream || origWhole !== origStream) {
-    return { patched: false, reason: `self-test mismatch (orig=${origWhole} native=${nativeWhole})` };
+    return (cached = { patched: false, reason: `self-test mismatch (orig=${origWhole} native=${nativeWhole})` });
   }
 
-  // Replace the hot methods. zlib.crc32 seeds at 0 (crc of empty) and returns the
-  // standard CRC32 directly, so accumulate with the running value.
   Crc32.prototype.update = function update(data) {
     if (!this.__nativeInit) { this.checksum = 0; this.__nativeInit = true; }
     this.checksum = zlib.crc32(data, this.checksum >>> 0);
@@ -64,6 +106,5 @@ export function installNativeCrc32() {
   Crc32.prototype.digest = function digest() {
     return this.__nativeInit ? this.checksum >>> 0 : 0; // crc32 of empty === 0
   };
-
-  return { patched: true };
+  return (cached = { patched: true, reason: 'patched legacy @aws-crypto/crc32 -> zlib.crc32' });
 }

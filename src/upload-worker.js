@@ -45,8 +45,10 @@ const {
 } = workerData;
 
 if (nativeCrc32) {
-  const r = installNativeCrc32();
-  if (!r.patched) console.error(`[native-crc32] not applied: ${r.reason}`);
+  const r = await installNativeCrc32();
+  if (r.patched) console.error(`[native-crc32] patched: ${r.reason}`);
+  else if (r.alreadyNative) console.error(`[native-crc32] no patch needed: ${r.reason}`);
+  else console.error(`[native-crc32] not applied: ${r.reason}`);
 }
 
 const tracker = ipThroughput ? new IpThroughputTracker((s) => s.bytesWritten) : null;
