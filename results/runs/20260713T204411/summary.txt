@@ -1,0 +1,44 @@
+[info] 30GiB: 10 file(s) x 30.00 GiB = 300.00 GiB, 9600 parts total, checksums: per-part CRC32 (SDK-validated)
+[part-times] wrote results/parttimes-30GiB-2026-07-13T2044.csv (9600 parts)
+[done] 30GiB (10 file(s)): 14869.5 MiB/s (124.735 Gbps) median over 1 runs; 9600/9600 parts checksum-validated
+[out] wrote JSON results to results/runs/20260713T204411/download-sweep.json
+
+=== S3 part-boundary download benchmark (AWS SDK JS v3) ===
+node=v24.18.0  sdk=@aws-sdk/client-s3@3.1080.0  @smithy/core@3.29.2
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003
+download unit=PartNumber  handler=undici  transport=HTTPS TLSv1.3/TLS_AES_128_GCM_SHA256  delivery=ordered-stream (max-buffered 64.00 GiB, buffer-pool ON)  checksum validation=ON  spread-conns=ON  workers=64  concurrency/worker=4  iterations=1 (warmup=1)
+
+size         files      total  parts   cksum  inflight   med MiB/s   med Gbps  best Gbps
+----------------------------------------------------------------------------------------
+30GiB           10 300.00 GiB   9600   CRC32       256     14869.5    124.735    124.735
+
+resource usage (whole process, during measured iterations):
+size              peak RSS     avg RSS  peak CPU   avg CPU  peak MEM
+--------------------------------------------------------------------
+30GiB            47.84 GiB   43.57 GiB      106%       94%     38.7%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+
+per-part download time (ms), across all measured iterations:
+size             parts      min      p50      p90      p99    p99.9      max     mean
+-------------------------------------------------------------------------------------
+30GiB             9600    339.6    490.3    742.6   1145.2   1558.4   2113.6    532.2
+
+[info] 30GiB: 10 file(s) x 30.00 GiB = 300.00 GiB, 960 parts/file, checksum CRC32, source memory
+[done] 30GiB (10 file(s)): 18368.7 MiB/s (154.088 Gbps) median over 1 runs
+[out] wrote JSON results to results/runs/20260713T204411/upload-sweep.json
+
+=== S3 multipart UPLOAD benchmark (AWS SDK JS v3) ===
+node=v24.18.0  sdk=@aws-sdk/client-s3@3.1080.0  @smithy/core@3.29.2
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003
+source=memory  handler=node  transport=HTTPS TLSv1.3/TLS_AES_128_GCM_SHA256  part-size=32.00 MiB  checksum=CRC32  spread-conns=ON  workers=64  concurrency/worker=4  iterations=1 (warmup=1)
+
+size         files      total  parts  inflight   med MiB/s   med Gbps  best Gbps
+---------------------------------------------------------------------------------
+30GiB           10 300.00 GiB   9600       256     18368.7    154.088    154.088
+
+resource usage (whole process, during measured iterations):
+size              peak RSS     avg RSS  peak CPU   avg CPU  peak MEM
+--------------------------------------------------------------------
+30GiB            12.63 GiB    9.53 GiB       99%       43%     10.2%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+

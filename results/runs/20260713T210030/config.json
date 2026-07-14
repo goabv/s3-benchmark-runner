@@ -1,0 +1,43 @@
+{
+  "bucket": "s3dl-bench-usw2-801400661003",
+  "region": "us-west-2",
+  "dataPrefix": "bench/",
+  "codePrefix": "code/",
+  "sizes": [{ "size": "30GiB", "count": 10 }],
+  "partSize": "32MiB",
+  "checksum": "CRC32",
+
+  "download": {
+    "workers": 64,
+    "concurrency": 4,
+    "iterations": 1,
+    "warmup": 1,
+    "keep": false,
+    "validateChecksum": true,
+    "deliveryMode": "ordered-stream",
+    "maxBufferedBytes": "64GiB",
+    "bufferPool": true,
+    "timeseries": false,
+    "stallTimeoutMs": 20000,
+    "partRetries": 8,
+    "partTimes": true,
+    "httpHandler": "node",
+    "spreadConnections": true,
+    "ipThroughputSizes": [],
+    "ipThroughput": false,
+    "ipThroughputFile": "results/ip-throughput.jsonl",
+    "tls": true
+  },
+
+  "upload": {
+    "workers": 64,
+    "concurrency": 4,
+    "iterations": 1,
+    "warmup": 1,
+    "httpHandler": "node",
+    "forceUpload": false,
+    "uploadSource": "memory",
+    "spreadConnections": true,
+    "ipThroughputSizes": []
+  }
+}

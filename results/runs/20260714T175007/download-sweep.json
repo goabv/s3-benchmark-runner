@@ -1,0 +1,118 @@
+{
+  "nodeVersion": "v22.23.1",
+  "sdkVersion": "3.1080.0",
+  "smithyCoreVersion": "3.29.2",
+  "config": {
+    "bucket": "s3dl-bench-usw2-801400661003",
+    "groups": [
+      {
+        "label": "30GiB",
+        "count": 10,
+        "keys": [
+          "bench/30gib-0.bin",
+          "bench/30gib-1.bin",
+          "bench/30gib-2.bin",
+          "bench/30gib-3.bin",
+          "bench/30gib-4.bin",
+          "bench/30gib-5.bin",
+          "bench/30gib-6.bin",
+          "bench/30gib-7.bin",
+          "bench/30gib-8.bin",
+          "bench/30gib-9.bin"
+        ]
+      }
+    ],
+    "region": "us-west-2",
+    "workers": 60,
+    "concurrency": 5,
+    "iterations": 1,
+    "warmup": 1,
+    "keep": false,
+    "validateChecksum": true,
+    "deliveryMode": "ordered-stream",
+    "deliveryPath": "/tmp",
+    "maxBufferedBytes": 68719476736,
+    "logConnections": false,
+    "spreadConnections": true,
+    "tls": true,
+    "httpHandler": "undici",
+    "cipher": "default",
+    "ciphers": null,
+    "stallTimeoutMs": 20000,
+    "partRetries": 8,
+    "timeseries": false,
+    "timeseriesFile": null,
+    "partTimes": true,
+    "partTimesFile": null,
+    "bufferPool": true,
+    "fileAsync": false,
+    "profile": false,
+    "profileDir": "results/profile-v22.23.1",
+    "nativeCrc32": false,
+    "ipThroughput": false,
+    "ipThroughputSizes": [],
+    "ipThroughputFile": "results/ip-throughput.jsonl",
+    "json": false,
+    "out": "results/runs/20260714T175007/download-sweep.json"
+  },
+  "results": [
+    {
+      "label": "30GiB",
+      "files": 10,
+      "perFileSize": 32212254720,
+      "size": 322122547200,
+      "parts": 9600,
+      "checksumAlgo": "CRC32",
+      "checksumValidated": true,
+      "deliveryMode": "ordered-stream",
+      "partsChecksummedPerRun": 9600,
+      "workers": 60,
+      "concurrency": 5,
+      "totalInFlight": 300,
+      "iterations": 1,
+      "samples": [
+        {
+          "secs": 16.962185733,
+          "mibps": 18110.873494466057,
+          "gbps": 151.92501828266592
+        }
+      ],
+      "median": {
+        "secs": 16.962185733,
+        "mibps": 18110.873494466057,
+        "gbps": 151.92501828266592
+      },
+      "best": {
+        "secs": 16.962185733,
+        "mibps": 18110.873494466057,
+        "gbps": 151.92501828266592
+      },
+      "resources": {
+        "peakRssBytes": 34149605376,
+        "avgRssBytes": 30042576589.977013,
+        "peakCpuPercent": 99.71999495103914,
+        "avgCpuPercent": 74.42665946024695,
+        "peakMemUtilPercent": 25.744476565790027,
+        "cpuCount": 64,
+        "totalMemBytes": 132648280064,
+        "samples": 174
+      },
+      "connectionSpread": null,
+      "ipThroughput": null,
+      "partTimeStats": {
+        "count": 9600,
+        "min": 339.4461310000006,
+        "p50": 451.7398299999986,
+        "p90": 650.3288289999982,
+        "p99": 1566.7174220000015,
+        "p999": 2043.1631860000016,
+        "max": 3064.387805999999,
+        "mean": 503.47409038062597
+      },
+      "tlsInfo": {
+        "protocol": "TLSv1.3",
+        "cipher": "TLS_AES_128_GCM_SHA256"
+      }
+    }
+  ]
+}
