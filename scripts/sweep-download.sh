@@ -23,11 +23,15 @@ node src/upload-test-data.js \
   ${PART_SIZE:+--part-size "$PART_SIZE"}
 
 echo ">> DOWNLOAD benchmarking configured sizes -> ${OUT}"
+# PROFILE=1 -> CPU-profile each worker; profiles land in results/profile-<node>/
+# (per node version, so runs under different nodes don't clobber). PROFILE_DIR overrides.
 node src/benchmark.js \
   ${WORKERS:+--workers "$WORKERS"} \
   ${CONCURRENCY:+--concurrency "$CONCURRENCY"} \
   ${ITERATIONS:+--iterations "$ITERATIONS"} \
   ${WARMUP:+--warmup "$WARMUP"} \
+  ${PROFILE:+--profile} \
+  ${PROFILE_DIR:+--profile-dir "$PROFILE_DIR"} \
   --out "$OUT"
 
 echo ">> Done. JSON: ${OUT}"

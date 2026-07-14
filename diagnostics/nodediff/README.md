@@ -87,6 +87,24 @@ node scripts/prof-top.mjs results/profile-v24.18.0/dl-worker-0.cpuprofile
 Use a **large** object (e.g. 30GiB) so the receive hot path dominates over
 worker-startup/module-load noise (the worker profile includes startup).
 
+### Profiling a full sweep under both node versions
+
+`sweep-download.sh` takes a `PROFILE=1` env passthrough, so you can profile the
+real download sweep end-to-end under each node without editing config:
+
+```bash
+nvm use 22 && PROFILE=1 ./scripts/sweep-download.sh    # -> results/profile-v22.x/
+nvm use 24 && PROFILE=1 ./scripts/sweep-download.sh    # -> results/profile-v24.x/
+
+# diff the hottest worker between versions:
+node scripts/prof-top.mjs results/profile-v22.23.1/dl-worker-0.cpuprofile 30
+node scripts/prof-top.mjs results/profile-v24.18.0/dl-worker-0.cpuprofile 30
+```
+
+The profile is taken in the **worker threads** (where the download runs); the seed
+step isn't profiled. Profiles go to `results/profile-<nodeVersion>/` by default
+(per-version, no clobber); set `PROFILE_DIR` to override. Windows: `$env:PROFILE=1`.
+
 ## Notes
 
 - The loopback server and client run in the same process (single event loop), so

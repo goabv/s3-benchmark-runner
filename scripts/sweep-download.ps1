@@ -29,6 +29,8 @@ if ($Workers -gt 0)     { $benchArgs += @("--workers", $Workers) }
 if ($Concurrency -gt 0) { $benchArgs += @("--concurrency", $Concurrency) }
 if ($Iterations -gt 0)  { $benchArgs += @("--iterations", $Iterations) }
 if ($Warmup -ge 0)      { $benchArgs += @("--warmup", $Warmup) }
+if ($env:PROFILE)       { $benchArgs += "--profile" }
+if ($env:PROFILE_DIR)   { $benchArgs += @("--profile-dir", $env:PROFILE_DIR) }
 
 Write-Host ">> Seeding configured sizes (bench.config.json), skipping existing objects"
 node "$root/src/upload-test-data.js" @seedArgs
