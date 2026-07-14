@@ -9,7 +9,8 @@ The download path, bottom to top, and the probe that isolates each:
 | Layer | Probe | What it measures |
 |-------|-------|------------------|
 | Bulk AEAD crypto (OpenSSL) | `crypto-aesgcm.mjs` | AES-128/256-GCM + ChaCha20 encrypt/decrypt MB/s — no network, no streams |
-| **Pure-JS CRC32 loop** | `crc32-js.mjs` | The SDK's checksum-validation hot loop in isolation — MB/s; bisect with V8 flags |
+| **JS CRC32 by coding pattern** | `crc32-js.mjs` | Compares indexed+local vs instance-field vs `for..of`+field (the real `@aws-crypto/crc32` pattern) — MB/s; bisect with V8 flags |
+| **Per-chunk stream receive** | `stream-chunks.mjs` | source → per-chunk transform (+optional checksum) → `for await` consumer — models `onSourceData`; MB/s + chunks/s |
 | TLS record crypto + stream | `loopback.mjs --tls` | HTTPS receive throughput over loopback (TLS decrypt + HTTP parse + stream drain) |
 | Plain stream / http / GC | `loopback.mjs` | Same over plain HTTP (no TLS) — isolates V8 / stream / parser / Buffer / GC |
 | TLS handshake / connect | `loopback.mjs --tls --fresh` | Per-request new connection — isolates handshake cost |
@@ -51,6 +52,13 @@ nvm use 24 && node --trace-opt   crc32-js.mjs   # which tier the loop reaches
 If `--no-maglev` recovers Node 22-like MB/s, the culprit is V8 13.6's Maglev
 mid-tier generating slower code for this loop — a specific, upstream-reportable
 finding.
+
+Note the *pattern* matters enormously regardless of version: on Node 24, the
+`@aws-crypto/crc32` pattern (`for..of` over a typed array + `this.checksum` field
+mutation) measured **~9× slower** than an indexed loop over a local variable (52
+vs 489 MB/s). So beyond any version regression, the SDK's checksum is slow because
+of *how* the loop is written — which is why native CRC (`zlib.crc32`) or skipping
+validation is the real speedup.
 
 ## Interpreting the diff
 

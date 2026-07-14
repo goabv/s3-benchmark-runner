@@ -31,7 +31,8 @@ run_all() {
   echo "==================================================================="
   echo "[fingerprint]"; "$node" fingerprint.mjs
   echo "[crypto-aesgcm] (OpenSSL bulk AEAD, no network)"; "$node" crypto-aesgcm.mjs
-  echo "[crc32-js] (pure-JS CRC32 loop the SDK uses for checksum validation)"; "$node" crc32-js.mjs --seconds 3
+  echo "[crc32-js] (JS CRC32 by coding pattern — local vs field vs for..of)"; "$node" crc32-js.mjs --seconds 3
+  echo "[stream-chunks] (per-chunk stream receive path, ~ real download)"; "$node" stream-chunks.mjs --chunk 65536 --stages 1 --checksum --total 1073741824
   echo "[loopback http  keepalive node]   (stream/http path, no TLS)"; "$node" loopback.mjs --conns 8 --duration 5 --gc-stats
   echo "[loopback https keepalive node]   (TLS record crypto + stream)"; "$node" loopback.mjs --tls --cipher "$CIPHER" --conns 8 --duration 5 --gc-stats
   echo "[loopback https fresh     node]   (per-request handshake cost)"; "$node" loopback.mjs --tls --cipher "$CIPHER" --conns 8 --duration 5 --fresh
