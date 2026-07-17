@@ -1,0 +1,24 @@
+[info] 30GiB: 1 file(s) x 30.00 GiB = 30.00 GiB, 1920 parts/file, checksum CRC32, source memory
+[setup] allocating 1 x 30.00 GiB = 30.00 GiB object buffer(s), random-filling (untimed) ...
+[progress] 30GiB 1.50/30.00 GiB (5%)  cur 12.9 Gbps  avg 12.9 Gbps  elapsed 1.0s  eta 19.0s
+[progress] 30GiB 25.25/30.00 GiB (84%)  cur 204.0 Gbps  avg 108.4 Gbps  elapsed 2.0s  eta 0.4s
+[progress] 30GiB 30.00/30.00 GiB (100%)  cur 40.8 Gbps  avg 85.9 Gbps  elapsed 3.0s
+[progress] 30GiB 30.00/30.00 GiB (100%)  cur 0.0 Gbps  avg 81.7 Gbps  elapsed 3.2s
+[done] 30GiB (1 file(s)): 9734.7 MiB/s (81.661 Gbps) median over 1 runs
+[out] wrote JSON results to results/runs/20260717T171748/upload-sweep.json
+
+=== S3 multipart UPLOAD benchmark (AWS SDK JS v3) ===
+node=v24.18.0  sdk=@aws-sdk/client-s3@3.1080.0  @smithy/core@3.29.2
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003
+source=memory (one SharedArrayBuffer per object, zero-copy part views)  handler=node  transport=HTTPS TLSv1.3/TLS_AES_128_GCM_SHA256  part-size=16.00 MiB  checksum=CRC32  spread-conns=ON  workers=64  concurrency/worker=8  iterations=1 (warmup=0)
+
+size         files      total  parts  inflight   med MiB/s   med Gbps  best Gbps
+---------------------------------------------------------------------------------
+30GiB            1  30.00 GiB   1920       512      9734.7     81.661     81.661
+
+resource usage (whole process, during measured iterations):
+size              peak RSS     avg RSS  peak CPU   avg CPU  main pk main avg  peak MEM
+--------------------------------------------------------------------------------------
+30GiB            40.21 GiB   35.38 GiB       97%       51%      40%       5%     32.5%
+(CPU% is of all 64 cores; main pk/avg = main-thread event-loop utilization, share of ONE core; MEM% is of 123.54 GiB total RAM)
+
