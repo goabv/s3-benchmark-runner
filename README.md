@@ -16,9 +16,13 @@ the body is read. Reports throughput (MiB/s and Gbps) per object.
 - The `med`/`best Gbps` window is the part transfer only (workers ready → all parts
   fetched and drained; for `ordered-stream`, until the consumer finishes the stream).
   Worker spawn / client init are excluded. An extra `e2e Gbps` column reports the
-  same transfer plus the one-time `HeadObject` planning (`describeMs`, measured once
-  and folded into each iteration) — i.e. "download call → drained." On in-region hosts
-  the HEAD is a few ms so `e2e ≈ transfer`; it matters most for small objects.
+  same transfer plus **every recurring per-call planning cost**: `HeadObject`
+  (`describeMs`), `buildParts` (part-boundary computation), and `assignParts`/queue-sort
+  (dispatch planning) — i.e. "download call → drained," to line up with an SDK public
+  API that does all of this inside one call. Genuinely one-time costs (worker-thread
+  spawn, client init, data generation) stay excluded, since a warm SDK transfer manager
+  does not repay them per call. The footer prints the breakdown. On in-region hosts these
+  helpers are a few ms so `e2e ≈ transfer`; they matter most for small objects.
 - Runs `warmup` unmeasured iterations, then `iterations` measured ones, and
   reports median + best, plus how many parts were checksum-validated.
 

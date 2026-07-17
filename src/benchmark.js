@@ -97,7 +97,10 @@ async function describeObject(client, bucket, key) {
  */
 // SLICE mode (discard / file): each worker owns a fixed slice and runs freely.
 function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets, validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler, ciphers, stallTimeoutMs, partRetries, partTimes, fileAsync, profile, profileDir, nativeCrc32, progressBuf, reporter }) {
+  // Per-call planning helper (recurring, not a one-time cost): fold into e2e.
+  const planStart = performance.now();
   const buckets = assignParts(parts, workers).filter((b) => b.length > 0);
+  const planMs = performance.now() - planStart;
   const active = buckets.length;
 
   return new Promise((resolve, reject) => {
@@ -160,6 +163,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
               partsDone: results.reduce((s, r) => s + r.parts, 0),
               checksummed: results.reduce((s, r) => s + r.checksummed, 0),
               wallMs,
+              planMs,
               ipCounts: [...runIp],
               ipThroughput: [...runIpTput],
               partTimes: runPartTimes,
@@ -187,6 +191,8 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
  * so the part delivery is waiting on is always fetched.
  */
 function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, validateChecksum, logConnections, spreadConnections, tls, ipThroughput, maxBufferedBytes, httpHandler, ciphers, timeseries, stallTimeoutMs, partRetries, partTimes, bufferPool, deliveryMode, consumerRate = 0, bufferReturn = true, streamHwm: streamHwmCfg = 0, profile, profileDir, nativeCrc32, progressBuf, reporter }) {
+  // Per-call planning helpers (recurring, not a one-time cost): fold into e2e.
+  const planStart = performance.now();
   const queue = [...parts].sort(
     (a, b) => a.partNumber - b.partNumber || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
   );
@@ -201,6 +207,7 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
   const partsPerKey = new Map();
   for (const p of queue) partsPerKey.set(p.key, (partsPerKey.get(p.key) || 0) + 1);
   const totalKeys = partsPerKey.size;
+  const planMs = performance.now() - planStart;
   // Per-object Readable + its backpressure state (stream sink only).
   const streams = new Map(); // key -> { readable, paused }
   // Transferred, completed-but-undelivered part buffers (stream sink only).
@@ -410,6 +417,7 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
           partsDone: deliveredCount,
           checksummed: deliveredChecksummed,
           wallMs: deliveryWallMs,
+          planMs,
           ipCounts: [...runIp],
           ipThroughput: [...runIpTput],
           timeseries: tsSamples,
@@ -648,13 +656,16 @@ async function benchmarkGroup(cfg, group) {
   const describeMs = performance.now() - describeStart;
   control.destroy();
 
-  // Pool parts across all files in the group into one work list.
+  // Pool parts across all files in the group into one work list. buildParts is a
+  // per-call planning helper (recurring), so time it and fold it into e2e.
+  const buildStart = performance.now();
   let parts = [];
   let totalBytes = 0;
   for (const { key, info } of infos) {
     parts = parts.concat(buildParts(key, info.partsCount, info.firstPartSize, info.totalSize));
     totalBytes += info.totalSize;
   }
+  const buildMs = performance.now() - buildStart;
   const first = infos[0].info;
   const perFileSize = first.totalSize;
   const groupLabel = group.label ?? group.keys[0];
@@ -750,8 +761,12 @@ async function benchmarkGroup(cfg, group) {
     for (let i = 0; i < cfg.iterations; i++) {
       const r = await doRun(makeReporter());
       const secs = r.wallMs / 1000;
-      const e2e = throughput(r.bytes, (r.wallMs + describeMs) / 1000); // + HEAD planning cost
-      samples.push({ ...r, secs, ...throughput(r.bytes, secs), e2eGbps: e2e.gbps, e2eMibps: e2e.mibps });
+      // e2e denominator = transfer wall + every recurring per-call planning cost:
+      // HeadObject (describeMs) + buildParts (buildMs) + assignParts/queue-sort (r.planMs).
+      // One-time costs (worker spawn, client init, data-gen) are intentionally excluded.
+      const planMs = describeMs + buildMs + (r.planMs ?? 0);
+      const e2e = throughput(r.bytes, (r.wallMs + planMs) / 1000);
+      samples.push({ ...r, secs, planTotalMs: planMs, ...throughput(r.bytes, secs), e2eGbps: e2e.gbps, e2eMibps: e2e.mibps });
       if (!negotiatedTls && r.tlsInfo) negotiatedTls = r.tlsInfo;
       lastIpCounts = r.ipCounts;
       if (runCfg.ipThroughput) {
@@ -819,7 +834,11 @@ async function benchmarkGroup(cfg, group) {
     concurrency: cfg.concurrency,
     totalInFlight: runCfg.workers * cfg.concurrency,
     iterations: cfg.iterations,
-    describeMs, // HeadObject planning time (once), folded into the e2e throughput
+    // Recurring per-call planning costs folded into e2e (all excluded from med/best):
+    describeMs, // HeadObject (measured once, attributed per iteration)
+    buildMs, // buildParts (measured once)
+    planMs: median.planMs ?? 0, // assignParts / queue-sort (per iteration; median shown)
+    planTotalMs: median.planTotalMs ?? describeMs + buildMs, // describe + build + plan
     samples: samples.map((s) => ({ secs: s.secs, mibps: s.mibps, gbps: s.gbps, e2eGbps: s.e2eGbps, e2eMibps: s.e2eMibps })),
     median: { secs: median.secs, mibps: median.mibps, gbps: median.gbps, e2eGbps: median.e2eGbps, e2eMibps: median.e2eMibps },
     best: { secs: best.secs, mibps: best.mibps, gbps: best.gbps },
@@ -895,8 +914,16 @@ function printHuman(cfg, all) {
   }
   console.log('');
   console.log(
-    `(med/best Gbps = part transfer only; e2e Gbps also includes the one-time ` +
-      `HeadObject planning: ${all.map((r) => `${r.label} ${r.describeMs?.toFixed(0) ?? 0}ms`).join(', ')})`,
+    `(med/best Gbps = part transfer only; e2e Gbps also includes the recurring per-call ` +
+      `planning — HeadObject + buildParts + assignParts/sort (worker spawn, client init and ` +
+      `data-gen are one-time and excluded): ` +
+      `${all
+        .map(
+          (r) =>
+            `${r.label} ${(r.planTotalMs ?? 0).toFixed(0)}ms ` +
+            `(head ${(r.describeMs ?? 0).toFixed(0)} + build ${(r.buildMs ?? 0).toFixed(0)} + plan ${(r.planMs ?? 0).toFixed(0)})`,
+        )
+        .join(', ')})`,
   );
   printResources(all);
   printPartTimes(all);
