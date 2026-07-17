@@ -478,12 +478,9 @@ Options (override bench.config.json):
                                     its part range (distributes ingress across cores).
                            open-stream = carver threads open whole-object streams and
                                     carve parts; a separate uploader pool uploads them.
-  --open-module <path>     ('open'/'open-stream' source) opener module. 'open':
-                           open(params,{start,size}); 'open-stream': open(params,
-                           {key,size}) -> one whole-object Readable.
+  --open-type <type>       ('open'/'open-stream' opener) file | memory. memory =
+                           generate bytes in-memory (no disk), fastest ingress.
   --carvers <n>            (open-stream) number of carver threads (0 = one per object).
-  --open-type <type>       ('open'/'open-stream' built-in opener) file | memory.
-                           memory = generate bytes in-memory (no disk), fastest ingress.
   --source-path <dir>      Directory for the 'file'/'open' source temp file.
   --max-buffered <size>    (stream) cap on carved-but-unsent parts held on main
                            (dispatch queue). 0 = auto ((workers*concurrency+1) parts).
@@ -569,6 +566,12 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     throw new Error(`Invalid uploadSource "${uploadSource}". Use memory | file | stream | open | open-stream.`);
   }
 
+  // Built-in opener type for 'open' / 'open-stream' (fixed params, no custom module).
+  const uploadOpenType = args['open-type'] ?? pick('uploadOpen')?.type ?? 'file';
+  if ((uploadSource === 'open' || uploadSource === 'open-stream') && !['file', 'memory'].includes(uploadOpenType)) {
+    throw new Error(`Invalid open type "${uploadOpenType}". Use file | memory.`);
+  }
+
   return {
     bucket,
     region: args.region || pick('region') || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION,
@@ -577,12 +580,11 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     partSize: parseSize(args['part-size'] ?? pick('partSize') ?? '64MiB'),
     checksum: (args.checksum ?? pick('checksum') ?? 'CRC32C').toUpperCase(),
     uploadSource,
-    // 'open' source: how each worker opens its own stream. Built-in { type: 'file' }
-    // (reads byte ranges of the shared source file) or { module, params } to import a
-    // custom opener module. For 'open' the opener is open(params, { start, size });
-    // for 'open-stream' it's open(params, { key, size }) returning one whole-object
-    // Readable (no ranges — the carver reads it sequentially).
-    uploadOpen: pick('uploadOpen') ?? (args['open-module'] ? { module: args['open-module'] } : { type: args['open-type'] ?? 'file' }),
+    // 'open' / 'open-stream' source: which built-in opener each worker uses.
+    //   file   - read from the shared source file ('open' = byte ranges,
+    //            'open-stream' = whole object)
+    //   memory - generate bytes in-memory (no disk), fastest ingress
+    uploadOpen: { type: uploadOpenType },
     // open-stream: number of carver threads (each opens whole-object streams and
     // carves parts for the uploader pool). 0 = auto (one per object, capped at that).
     uploadCarvers: Number(args.carvers ?? pick('uploadCarvers') ?? 0),

@@ -13,7 +13,12 @@ the body is read. Reports throughput (MiB/s and Gbps) per object.
 - Distributes part numbers `1..N` round-robin across `workers` worker threads.
 - Each worker runs up to `concurrency` `PartNumber` GETs in parallel with
   `ChecksumMode: ENABLED`, draining (or optionally keeping) the bodies.
-- Excludes worker spawn / client init from the timed window (ready/start handshake).
+- The `med`/`best Gbps` window is the part transfer only (workers ready → all parts
+  fetched and drained; for `ordered-stream`, until the consumer finishes the stream).
+  Worker spawn / client init are excluded. An extra `e2e Gbps` column reports the
+  same transfer plus the one-time `HeadObject` planning (`describeMs`, measured once
+  and folded into each iteration) — i.e. "download call → drained." On in-region hosts
+  the HEAD is a few ms so `e2e ≈ transfer`; it matters most for small objects.
 - Runs `warmup` unmeasured iterations, then `iterations` measured ones, and
   reports median + best, plus how many parts were checksum-validated.
 
@@ -175,7 +180,7 @@ A representative config (this repo's current one):
 | `warmup` | `1` | Unmeasured priming run. |
 | `forceUpload` | `false` | If `true`, upload even when a matching object already exists; otherwise skip objects whose size **and** part size already match. |
 | `uploadSource` | `memory` | Where part bytes come from: `memory` (pre-built buffer, generation excluded from timing), `file` (read each part from disk inline — measures disk + upload),, `stream` (the customer hands one `Readable` per object to main; main carves + transfers parts to a pool of uploader threads), or `open` (the customer passes a re-openable source descriptor; each worker opens its own stream for its part range — distributes ingress across cores). See the Data source section below. |
-| `uploadOpen` | `{ "type": "file" }` | **open / open-stream only.** The source descriptor: `{ "type": "file" }` (read the shared source file), `{ "type": "memory" }` (generate bytes in-memory on each worker — no disk, fastest ingress), or `{ "module": "./opener.js", "params": {…} }` to import a custom opener. For `open` the export is `open(params, { start, size }) -> Readable`; for `open-stream` it's `open(params, { key, size }) -> Readable` (one whole-object stream). The module path is resolved to an absolute URL on main. |
+| `uploadOpen` | `{ "type": "file" }` | **open / open-stream only.** The source descriptor: `{ "type": "file" }` (read the shared source file), `{ "type": "memory" }` (generate bytes in-memory on each worker — no disk, fastest ingress). Fixed built-in openers only. |
 | `uploadCarvers` | `0` (auto) | **open-stream only.** Number of carver threads. `0` = one per object; set lower to put multiple objects on each carver (they're carved sequentially). Carvers + uploaders (`workers`) are separate pools, so total threads ≈ `carvers + workers`. |
 | `uploadMaxBuffered` | `0` (auto) | **stream source only.** Cap (bytes) on carved-but-not-yet-uploaded parts held on main (the dispatch queue). Bounds memory and gives the uploader pool a surplus to pull from; when full, main pauses reading the customer stream (backpressure). `0` = auto (`workers × concurrency + 1` parts). |
 | `uploadClientRate` | `0` | **stream source only.** Throttle the simulated customer stream to this many bytes/sec per object (models client send rate). `0` = as fast as possible. |
@@ -333,15 +338,17 @@ Honest ceiling: the ingress (read + fill) is single-threaded on main (~one core'
 "upload": { "uploadSource": "open", "uploadOpen": { "type": "file" } }
 ```
 
-- **Built-in file opener** (`{ "type": "file" }`, the default): a shared source file is written up front (untimed), and each worker opens `fs.createReadStream(path, { start, end })` for each of its parts' byte ranges, drains it, and uploads. Because a file is range-addressable, one object's ingress spans all workers.
-- **Custom module opener** (`{ "module": "./my-opener.js", "params": { ... } }`, or `--open-module`): each worker `import()`s the module and calls its exported `open(params, { start, size }) -> Readable`. This is the "customer's open callback, executed on the worker" — delivered as an importable module (a function/closure can't be structured-cloned). Use it for any range-addressable source (HTTP Range, S3, a generator).
+- **file opener** (`{ "type": "file" }`, the default): a shared source file is written up front (untimed), and each worker opens `fs.createReadStream(path, { start, end })` for each of its parts' byte ranges, drains it, and uploads. Because a file is range-addressable, one object's ingress spans all workers.
+- **memory opener** (`{ "type": "memory" }`, or `--open-type memory`): each worker generates its part's bytes in-memory (no disk) from a reused template — fastest ingress.
+
+(These are the only two built-in openers — fixed params, no custom callback module for now.)
 
 The requirement is that the source be **re-openable from a reference on the worker's thread** (a path, URL, key + byte range). That's what lets ingress parallelize — unlike a live push stream, which is stuck on main (`stream` mode). Use `open` to lift the single-thread ingress ceiling when the source is seekable; use `stream` when the customer genuinely hands you one live stream.
 
-**Open-stream source (`open-stream`) — two tiers: carvers + uploaders.** Where `open` opens a *ranged* read per part (needs a seekable source), `open-stream` handles a source that's only *sequential per object*: **carver** threads each open one whole-object `Readable` (via the opener, `open(params, { key, size })`), read it front-to-back, and carve part buffers; a separate **uploader** pool does the `UploadPart`s.
+**Open-stream source (`open-stream`) — two tiers: carvers + uploaders.** Where `open` opens a *ranged* read per part (needs a seekable source), `open-stream` handles a source that's only *sequential per object*: **carver** threads each open one whole-object `Readable` (the built-in `file` or `memory` opener), read it front-to-back, and carve part buffers; a separate **uploader** pool does the `UploadPart`s.
 
 ```json
-"upload": { "uploadSource": "open-stream", "uploadCarvers": 4, "uploadOpen": { "type": "file" } }
+"upload": { "uploadSource": "open-stream", "uploadCarvers": 4, "uploadOpen": { "type": "memory" } }
 ```
 
 - Parts flow **carver → main → uploader** by zero-copy transfer; main brokers and, when a part finishes uploading, transfers the freed buffer **back to its carver** with an `ack`. That ack is also a **credit**: a carver never has more than `uploadMaxBuffered / carvers` parts outstanding, so it pauses reading its stream when the uploader pool falls behind (end-to-end backpressure, bounded memory).
@@ -977,8 +984,7 @@ Shares the tuning flags above (`--workers`, `--concurrency`, `--iterations`,
 | `--part-size <size>` | `partSize` | Multipart part size |
 | `--checksum <algo>` | `checksum` | `CRC32` \| `CRC32C` \| `SHA256` \| `SHA1` |
 | `--source <mode>` | `uploadSource` | `memory` \| `file` \| `stream` \| `open` \| `open-stream` |
-| `--open-module <path>` | `uploadOpen.module` | `open`/`open-stream` source: opener module |
-| `--open-type <type>` | `uploadOpen.type` | built-in opener: `file` \| `memory` (in-memory, no disk) |
+| `--open-type <type>` | `uploadOpen.type` | `open`/`open-stream` opener: `file` \| `memory` (in-memory, no disk) |
 | `--carvers <n>` | `uploadCarvers` | open-stream: carver thread count (0 = one per object) |
 | `--max-buffered <size>` | `uploadMaxBuffered` | stream source: main-side dispatch queue cap (0 = auto) |
 | `--client-rate <size>` | `uploadClientRate` | stream source: throttle simulated client bytes/sec (0 = unlimited) |

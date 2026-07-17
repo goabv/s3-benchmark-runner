@@ -35,7 +35,7 @@ const {
   uploadSource, // 'memory' | 'file' | 'stream' | 'open' | 'open-stream'
   role, // 'carver' | 'uploader' (open-stream two-tier); undefined = single-tier
   sourceFilePath, // for uploadSource === 'file'
-  openDesc, // for uploadSource === 'open'(-stream): { type:'file', path } | { module, params }
+  openDesc, // for uploadSource === 'open'(-stream): { type:'file', path } | { type:'memory', chunk }
   carverObjects, // carver role: [{ key, uploadId(set on carve), size, baseParts }]
   carverLimit = 1, // carver role: max outstanding (un-acked) parts before pausing
   spreadConnections,
@@ -128,19 +128,14 @@ if (role === 'carver') {
 
   // Resolve the whole-object opener: open(params, { key, size }) -> Readable.
   let openObject;
-  if (openDesc?.module) {
-    const mod = await import(openDesc.module);
-    openObject = (key, size) => mod.open(openDesc.params, { key, size });
-  } else if (openDesc?.type === 'memory') {
+  if (openDesc?.type === 'memory') {
     // Generate bytes in-memory (no disk): the benchmark "pushes" the object into
     // the stream from a reused template — ingress is memcpy speed, per carver.
     const tmpl = Buffer.allocUnsafe(Math.max(1, openDesc.chunk || 1 << 20));
     randomFillSync(tmpl);
     openObject = (key, size) => memoryStream(size, tmpl);
-  } else if ((openDesc?.type ?? 'file') === 'file') {
-    openObject = () => createReadStream(openDesc.path); // whole file = one object's bytes
   } else {
-    throw new Error(`unknown 'open-stream' descriptor: ${JSON.stringify(openDesc)}`);
+    openObject = () => createReadStream(openDesc.path); // whole file = one object's bytes
   }
 
   parentPort.on('message', async (msg) => {
@@ -251,18 +246,13 @@ else if (role === 'uploader' || uploadSource === 'stream') {
   } else if (uploadSource === 'open') {
     // Factory pattern: resolve the opener ON THIS WORKER from the descriptor, so
     // each worker opens its own stream for its part ranges (distributed ingress).
-    if (openDesc?.module) {
-      const mod = await import(openDesc.module);
-      openStream = (part) => mod.open(openDesc.params, { start: part.start, size: part.size });
-    } else if (openDesc?.type === 'memory') {
+    if (openDesc?.type === 'memory') {
       const tmpl = Buffer.allocUnsafe(Math.max(1, openDesc.chunk || 1 << 20));
       randomFillSync(tmpl);
       openStream = (part) => memoryStream(part.size, tmpl); // generate the part in-memory
-    } else if ((openDesc?.type ?? 'file') === 'file') {
+    } else {
       openStream = (part) =>
         createReadStream(openDesc.path, { start: part.start, end: part.start + part.size - 1 }); // end inclusive
-    } else {
-      throw new Error(`unknown 'open' source descriptor: ${JSON.stringify(openDesc)}`);
     }
   } else {
     buffer = Buffer.allocUnsafe(maxPartSize);

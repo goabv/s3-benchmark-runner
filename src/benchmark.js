@@ -627,8 +627,11 @@ function writeTimeseries(cfg, label, tsByIter) {
 async function benchmarkGroup(cfg, group) {
   const control = makeClient({ region: cfg.region });
   // Describe every file in the group. A missing file throws (download "fails if
-  // it does not find enough files of that size").
+  // it does not find enough files of that size"). Timed so we can also report an
+  // end-to-end throughput that includes the HeadObject planning cost (measured
+  // once here and attributed to each iteration — HEAD is tiny and stable).
   const infos = [];
+  const describeStart = performance.now();
   for (const key of group.keys) {
     try {
       infos.push({ key, info: await describeObject(control, cfg.bucket, key) });
@@ -642,6 +645,7 @@ async function benchmarkGroup(cfg, group) {
       );
     }
   }
+  const describeMs = performance.now() - describeStart;
   control.destroy();
 
   // Pool parts across all files in the group into one work list.
@@ -746,7 +750,8 @@ async function benchmarkGroup(cfg, group) {
     for (let i = 0; i < cfg.iterations; i++) {
       const r = await doRun(makeReporter());
       const secs = r.wallMs / 1000;
-      samples.push({ ...r, secs, ...throughput(r.bytes, secs) });
+      const e2e = throughput(r.bytes, (r.wallMs + describeMs) / 1000); // + HEAD planning cost
+      samples.push({ ...r, secs, ...throughput(r.bytes, secs), e2eGbps: e2e.gbps, e2eMibps: e2e.mibps });
       if (!negotiatedTls && r.tlsInfo) negotiatedTls = r.tlsInfo;
       lastIpCounts = r.ipCounts;
       if (runCfg.ipThroughput) {
@@ -814,8 +819,9 @@ async function benchmarkGroup(cfg, group) {
     concurrency: cfg.concurrency,
     totalInFlight: runCfg.workers * cfg.concurrency,
     iterations: cfg.iterations,
-    samples: samples.map((s) => ({ secs: s.secs, mibps: s.mibps, gbps: s.gbps })),
-    median: { secs: median.secs, mibps: median.mibps, gbps: median.gbps },
+    describeMs, // HeadObject planning time (once), folded into the e2e throughput
+    samples: samples.map((s) => ({ secs: s.secs, mibps: s.mibps, gbps: s.gbps, e2eGbps: s.e2eGbps, e2eMibps: s.e2eMibps })),
+    median: { secs: median.secs, mibps: median.mibps, gbps: median.gbps, e2eGbps: median.e2eGbps, e2eMibps: median.e2eMibps },
     best: { secs: best.secs, mibps: best.mibps, gbps: best.gbps },
     resources,
     connectionSpread,
@@ -857,9 +863,10 @@ function printHuman(cfg, all) {
   const padS = (s, n) => String(s).padStart(n);
   console.log(
     pad('size', 12) + padS('files', 6) + padS('total', 11) + padS('parts', 7) + padS('cksum', 8) +
-      padS('inflight', 10) + padS('med MiB/s', 12) + padS('med Gbps', 11) + padS('best Gbps', 11),
+      padS('inflight', 10) + padS('med MiB/s', 12) + padS('med Gbps', 11) + padS('best Gbps', 11) +
+      padS('e2e Gbps', 11),
   );
-  console.log('-'.repeat(88));
+  console.log('-'.repeat(99));
   for (const r of all) {
     console.log(
       pad(r.label, 12) +
@@ -870,10 +877,15 @@ function printHuman(cfg, all) {
         padS(r.totalInFlight, 10) +
         padS(r.median.mibps.toFixed(1), 12) +
         padS(r.median.gbps.toFixed(3), 11) +
-        padS(r.best.gbps.toFixed(3), 11),
+        padS(r.best.gbps.toFixed(3), 11) +
+        padS((r.median.e2eGbps ?? r.median.gbps).toFixed(3), 11),
     );
   }
   console.log('');
+  console.log(
+    `(med/best Gbps = part transfer only; e2e Gbps also includes the one-time ` +
+      `HeadObject planning: ${all.map((r) => `${r.label} ${r.describeMs?.toFixed(0) ?? 0}ms`).join(', ')})`,
+  );
   printResources(all);
   printPartTimes(all);
   printConnectionsAndIps(all);
@@ -922,9 +934,10 @@ function printResources(all) {
   console.log('resource usage (whole process, during measured iterations):');
   console.log(
     pad('size', 14) + padS('peak RSS', 12) + padS('avg RSS', 12) +
-      padS('peak CPU', 10) + padS('avg CPU', 10) + padS('peak MEM', 10),
+      padS('peak CPU', 10) + padS('avg CPU', 10) +
+      padS('main pk', 9) + padS('main avg', 9) + padS('peak MEM', 10),
   );
-  console.log('-'.repeat(68));
+  console.log('-'.repeat(86));
   for (const r of all) {
     const rs = r.resources;
     console.log(
@@ -933,11 +946,14 @@ function printResources(all) {
         padS(formatBytes(rs.avgRssBytes), 12) +
         padS(`${rs.peakCpuPercent.toFixed(0)}%`, 10) +
         padS(`${rs.avgCpuPercent.toFixed(0)}%`, 10) +
+        padS(`${rs.peakMainPercent.toFixed(0)}%`, 9) +
+        padS(`${rs.avgMainPercent.toFixed(0)}%`, 9) +
         padS(`${rs.peakMemUtilPercent.toFixed(1)}%`, 10),
     );
   }
   console.log(
     `(CPU% is of all ${all[0].resources.cpuCount} cores; ` +
+      `main pk/avg = main-thread event-loop utilization, share of ONE core; ` +
       `MEM% is of ${formatBytes(all[0].resources.totalMemBytes)} total RAM)\n`,
   );
 }

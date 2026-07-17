@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Worker } from 'node:worker_threads';
 import { Readable } from 'node:stream';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { writeFileSync, mkdirSync, createWriteStream, rmSync } from 'node:fs';
 import { randomFillSync } from 'node:crypto';
 import { createRequire } from 'node:module';
@@ -633,15 +633,10 @@ async function uploadIterationGroup(control, cfg, keys, baseParts, maxSockets, s
   // file, not the customer's cwd), with the source path passed through in params.
   let openDesc = null;
   if (cfg.uploadSource === 'open' || cfg.uploadSource === 'open-stream') {
-    if (cfg.uploadOpen?.module) {
-      openDesc = { module: pathToFileURL(path.resolve(cfg.uploadOpen.module)).href, params: { ...cfg.uploadOpen.params, sourceFilePath } };
-    } else if (cfg.uploadOpen?.type === 'memory') {
-      // In-memory opener: workers generate bytes from a template (no disk). The emit
-      // chunk size reuses uploadClientChunk.
-      openDesc = { type: 'memory', chunk: cfg.uploadClientChunk };
-    } else {
-      openDesc = { type: 'file', path: sourceFilePath };
-    }
+    openDesc =
+      cfg.uploadOpen?.type === 'memory'
+        ? { type: 'memory', chunk: cfg.uploadClientChunk } // generate in-memory (no disk)
+        : { type: 'file', path: sourceFilePath }; // read the shared source file
   }
 
   const common = {
@@ -732,12 +727,11 @@ async function benchmarkGroup(cfg, group) {
     progressBuf ? new ProgressReporter(progressBuf, totalBytes, { label: progressLabel }) : null;
 
   try {
-    // 'file' and the built-in *file* opener of 'open'/'open-stream' need a source
-    // file. The 'memory' opener and module openers do not.
+    // 'file' and the 'file' opener of 'open'/'open-stream' need a source file;
+    // the 'memory' opener generates bytes in-memory, so it does not.
     const needsSourceFile =
       cfg.uploadSource === 'file' ||
       ((cfg.uploadSource === 'open' || cfg.uploadSource === 'open-stream') &&
-        !cfg.uploadOpen?.module &&
         (cfg.uploadOpen?.type ?? 'file') === 'file');
     if (needsSourceFile) {
       mkdirSync(cfg.sourcePath, { recursive: true }); // createWriteStream won't create parents
@@ -834,9 +828,9 @@ function printHuman(cfg, all) {
       cfg.uploadSource === 'stream'
         ? ` (main-carve->worker-pool, max-buffered ${cfg.uploadMaxBuffered > 0 ? formatBytes(cfg.uploadMaxBuffered) : 'auto'}, client-chunk ${formatBytes(cfg.uploadClientChunk)}${cfg.uploadClientRate > 0 ? `, client ${formatBytes(cfg.uploadClientRate)}/s` : ''})`
         : cfg.uploadSource === 'open'
-          ? ` (worker-open ${cfg.uploadOpen?.module ? `module ${cfg.uploadOpen.module}` : (cfg.uploadOpen?.type ?? 'file')})`
+          ? ` (worker-open ${cfg.uploadOpen?.type ?? 'file'})`
           : cfg.uploadSource === 'open-stream'
-            ? ` (carvers${cfg.uploadCarvers > 0 ? ` x${cfg.uploadCarvers}` : ' auto'} -> uploaders x${cfg.workers}, ${cfg.uploadOpen?.module ? `module ${cfg.uploadOpen.module}` : (cfg.uploadOpen?.type ?? 'file')})`
+            ? ` (carvers${cfg.uploadCarvers > 0 ? ` x${cfg.uploadCarvers}` : ' auto'} -> uploaders x${cfg.workers}, ${cfg.uploadOpen?.type ?? 'file'})`
             : ''
     }  ` +
       `handler=${cfg.httpHandler}  transport=${uploadTlsNote(cfg, all)}  ` +
@@ -877,9 +871,10 @@ function printResources(all) {
   console.log('resource usage (whole process, during measured iterations):');
   console.log(
     pad('size', 14) + padS('peak RSS', 12) + padS('avg RSS', 12) +
-      padS('peak CPU', 10) + padS('avg CPU', 10) + padS('peak MEM', 10),
+      padS('peak CPU', 10) + padS('avg CPU', 10) +
+      padS('main pk', 9) + padS('main avg', 9) + padS('peak MEM', 10),
   );
-  console.log('-'.repeat(68));
+  console.log('-'.repeat(86));
   for (const r of all) {
     const rs = r.resources;
     console.log(
@@ -888,11 +883,14 @@ function printResources(all) {
         padS(formatBytes(rs.avgRssBytes), 12) +
         padS(`${rs.peakCpuPercent.toFixed(0)}%`, 10) +
         padS(`${rs.avgCpuPercent.toFixed(0)}%`, 10) +
+        padS(`${rs.peakMainPercent.toFixed(0)}%`, 9) +
+        padS(`${rs.avgMainPercent.toFixed(0)}%`, 9) +
         padS(`${rs.peakMemUtilPercent.toFixed(1)}%`, 10),
     );
   }
   console.log(
     `(CPU% is of all ${all[0].resources.cpuCount} cores; ` +
+      `main pk/avg = main-thread event-loop utilization, share of ONE core; ` +
       `MEM% is of ${formatBytes(all[0].resources.totalMemBytes)} total RAM)\n`,
   );
 }

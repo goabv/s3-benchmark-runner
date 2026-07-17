@@ -1,4 +1,5 @@
 import os from 'node:os';
+import { performance } from 'node:perf_hooks';
 
 /**
  * Samples process resource usage on an interval so we can report peak/avg memory
@@ -25,11 +26,14 @@ export class ResourceMonitor {
     this.rssSum = 0;
     this.samples = 0;
     this.peakCpuPercent = 0;
+    this.peakMainPercent = 0; // main-thread event-loop utilization (% of one core)
     this._timer = null;
     this._lastCpu = null;
     this._lastHr = null;
     this._startCpu = null;
     this._startHr = null;
+    this._lastElu = null;
+    this._startElu = null;
   }
 
   start() {
@@ -41,6 +45,9 @@ export class ResourceMonitor {
     this._startHr = hr;
     this._lastCpu = cpu;
     this._lastHr = hr;
+    // Main-thread event-loop utilization (this thread only), for peak + avg.
+    this._startElu = performance.eventLoopUtilization();
+    this._lastElu = this._startElu;
     this._sampleMem();
     this._timer = setInterval(() => this._tick(), this.intervalMs);
     if (this._timer.unref) this._timer.unref(); // don't keep the event loop alive
@@ -67,6 +74,13 @@ export class ResourceMonitor {
     }
     this._lastCpu = cpu;
     this._lastHr = nowHr;
+
+    // Main-thread event-loop utilization for this interval (fraction of one core).
+    const eluNow = performance.eventLoopUtilization();
+    const d = performance.eventLoopUtilization(eluNow, this._lastElu);
+    const mainPct = d.utilization * 100;
+    if (mainPct > this.peakMainPercent) this.peakMainPercent = mainPct;
+    this._lastElu = eluNow;
   }
 
   /** Stop sampling and return the collected stats. */
@@ -85,11 +99,18 @@ export class ResourceMonitor {
     const avgCpuPercent =
       totalWallMicros > 0 ? (totalCpuMicros / totalWallMicros / this.cpuCount) * 100 : 0;
 
+    // Main-thread event-loop utilization over the whole window (fraction of one core).
+    const avgMainPercent =
+      performance.eventLoopUtilization(performance.eventLoopUtilization(), this._startElu).utilization * 100;
+
     return {
       peakRssBytes: this.peakRss,
       avgRssBytes: this.samples ? this.rssSum / this.samples : 0,
       peakCpuPercent: this.peakCpuPercent, // % of all cores (machine utilization)
       avgCpuPercent, // % of all cores, averaged over the measured window
+      // Main thread only, via event-loop utilization (% of ONE core / one thread):
+      peakMainPercent: this.peakMainPercent,
+      avgMainPercent,
       peakMemUtilPercent: this.totalMem ? (this.peakRss / this.totalMem) * 100 : 0,
       cpuCount: this.cpuCount,
       totalMemBytes: this.totalMem,
