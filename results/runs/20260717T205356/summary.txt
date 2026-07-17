@@ -1,0 +1,48 @@
+[info] 30GiB: 10 file(s) x 30.00 GiB = 300.00 GiB, 9600 parts total, checksums: per-part CRC32 (SDK-validated)
+[progress] 30GiB x10 1.13/300.00 GiB (0%)  cur 9.7 Gbps  avg 9.7 Gbps  elapsed 1.0s  eta 265.5s
+[progress] 30GiB x10 10.44/300.00 GiB (3%)  cur 79.9 Gbps  avg 44.8 Gbps  elapsed 2.0s  eta 55.5s
+[progress] 30GiB x10 21.88/300.00 GiB (7%)  cur 98.3 Gbps  avg 62.6 Gbps  elapsed 3.0s  eta 38.1s
+[progress] 30GiB x10 36.59/300.00 GiB (12%)  cur 126.4 Gbps  avg 78.6 Gbps  elapsed 4.0s  eta 28.8s
+[progress] 30GiB x10 52.66/300.00 GiB (18%)  cur 138.0 Gbps  avg 90.5 Gbps  elapsed 5.0s  eta 23.5s
+[progress] 30GiB x10 67.53/300.00 GiB (23%)  cur 127.6 Gbps  avg 96.7 Gbps  elapsed 6.0s  eta 20.7s
+[progress] 30GiB x10 83.47/300.00 GiB (28%)  cur 136.9 Gbps  avg 102.4 Gbps  elapsed 7.0s  eta 18.2s
+[progress] 30GiB x10 98.94/300.00 GiB (33%)  cur 132.1 Gbps  avg 106.1 Gbps  elapsed 8.0s  eta 16.3s
+[progress] 30GiB x10 114.50/300.00 GiB (38%)  cur 134.4 Gbps  avg 109.3 Gbps  elapsed 9.0s  eta 14.6s
+[progress] 30GiB x10 129.66/300.00 GiB (43%)  cur 130.2 Gbps  avg 111.4 Gbps  elapsed 10.0s  eta 13.1s
+[progress] 30GiB x10 144.59/300.00 GiB (48%)  cur 128.3 Gbps  avg 112.9 Gbps  elapsed 11.0s  eta 11.8s
+[progress] 30GiB x10 159.81/300.00 GiB (53%)  cur 129.8 Gbps  avg 114.3 Gbps  elapsed 12.0s  eta 10.5s
+[progress] 30GiB x10 175.34/300.00 GiB (58%)  cur 132.8 Gbps  avg 115.7 Gbps  elapsed 13.0s  eta 9.3s
+[progress] 30GiB x10 190.94/300.00 GiB (64%)  cur 134.1 Gbps  avg 117.1 Gbps  elapsed 14.0s  eta 8.0s
+[progress] 30GiB x10 205.63/300.00 GiB (69%)  cur 125.5 Gbps  avg 117.6 Gbps  elapsed 15.0s  eta 6.9s
+[progress] 30GiB x10 221.03/300.00 GiB (74%)  cur 131.8 Gbps  avg 118.5 Gbps  elapsed 16.0s  eta 5.7s
+[progress] 30GiB x10 236.41/300.00 GiB (79%)  cur 132.1 Gbps  avg 119.3 Gbps  elapsed 17.0s  eta 4.6s
+[progress] 30GiB x10 251.63/300.00 GiB (84%)  cur 130.7 Gbps  avg 119.9 Gbps  elapsed 18.0s  eta 3.5s
+[progress] 30GiB x10 266.97/300.00 GiB (89%)  cur 131.8 Gbps  avg 120.6 Gbps  elapsed 19.0s  eta 2.4s
+[progress] 30GiB x10 281.97/300.00 GiB (94%)  cur 128.8 Gbps  avg 121.0 Gbps  elapsed 20.0s  eta 1.3s
+[progress] 30GiB x10 299.03/300.00 GiB (100%)  cur 146.6 Gbps  avg 122.2 Gbps  elapsed 21.0s  eta 0.1s
+[progress] 30GiB x10 300.00/300.00 GiB (100%)  cur 42.0 Gbps  avg 121.4 Gbps  elapsed 21.2s
+[part-times] wrote results/parttimes-30GiB-2026-07-17T2054.csv (9600 parts)
+[done] 30GiB (10 file(s)): 14477.4 MiB/s (121.445 Gbps) median over 1 runs; 9600/9600 parts checksum-validated
+[out] wrote JSON results to results/runs/20260717T205356/download-sweep.json
+
+=== S3 part-boundary download benchmark (AWS SDK JS v3) ===
+node=v24.18.0  sdk=@aws-sdk/client-s3@3.1080.0  @smithy/core@3.29.2
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003
+download unit=PartNumber  handler=undici  transport=HTTPS TLSv1.3/TLS_AES_128_GCM_SHA256  api=S3TransferManager (x concurrent download() + concurrent drain)  delivery=stream (per-object Readable, max-buffered 48.00 GiB)  checksum validation=ON  spread-conns=ON  workers=60  concurrency/worker=6  iterations=1 (warmup=0)
+
+size         files      total  parts   cksum  inflight   med MiB/s   med Gbps  best Gbps   e2e Gbps
+---------------------------------------------------------------------------------------------------
+30GiB           10 300.00 GiB   9600   CRC32       360     14477.4    121.445    121.445    121.445
+
+(S3TransferManager API: med/best/e2e Gbps = full download() call -> streams drained, incl. HeadObject + planning. One-time pool spawn + client init (excluded): 30GiB 361ms)
+resource usage (whole process, during measured iterations):
+size              peak RSS     avg RSS  peak CPU   avg CPU  main pk main avg  peak MEM
+--------------------------------------------------------------------------------------
+30GiB            55.01 GiB   45.76 GiB      106%       96%     100%      97%     44.5%
+(CPU% is of all 64 cores; main pk/avg = main-thread event-loop utilization, share of ONE core; MEM% is of 123.54 GiB total RAM)
+
+per-part download time (ms), across all measured iterations:
+size             parts      min      p50      p90      p99    p99.9      max     mean
+-------------------------------------------------------------------------------------
+30GiB             9600    340.6    698.1   1119.4   1697.2   2531.5   3558.7    763.3
+

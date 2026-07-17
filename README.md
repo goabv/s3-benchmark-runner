@@ -157,6 +157,7 @@ A representative config (this repo's current one):
 | `keep` | `false` | If `true`, retain downloaded bytes in memory instead of discarding. Leave `false` to measure the pure network/CPU ceiling without buffering cost. |
 | `validateChecksum` | `true` | Whether the SDK validates each part's stored checksum as it streams. Set `false` to isolate raw transfer throughput from the checksum CPU cost. |
 | `deliveryMode` | `ordered-drop` | What happens to bytes: `discard` (drain + drop on arrival — pure ceiling, no ordering), `ordered-drop` (reorder buffer, delivered in part order then dropped at the frontier — models the ordering machinery with no consumer), `ordered-stream` (reorder, then transfer each part zero-copy into a per-object `Readable` a consumer drains — models a real user reading a stream per object), or `file` (positional write to disk). See [Delivery modes](#delivery-modes-what-happens-to-downloaded-bytes). |
+| `api` | `true` (default) | Route the download through the `S3TransferManager` API — **this is the default and recommended path**. The pool is constructed **once** (spawn + client init = one-time, reported separately as "pool spawn"); each iteration fires **x concurrent `download()` calls** (one per object) and drains the returned per-object `Readable`s **concurrently**. The measured window is the full "`download()` call → streams drained", so `med`/`best`/`e2e` all include HeadObject + planning — the cleanest apples-to-apples with a warm transfer manager. Delivery is always per-object streams; `deliveryMode` is ignored. Set `api:false` (or `--no-api`) to fall back to the legacy `deliveryMode` run loop (`discard`/`ordered-drop`/`ordered-stream`/`file`). See [Download API](#download-api-s3transfermanager). |
 | `maxBufferedBytes` | `64GiB` | **ordered modes only.** Cap on the completed-but-undelivered reorder backlog; dispatch throttles above it (with one-part liveness so it can't hang). Bigger = keeps full concurrency at higher memory; smaller = tighter RSS but can throttle behind a slow low part. |
 | `bufferPool` | `true` | **ordered-drop only.** Copy each part into a reused contiguous buffer instead of retaining raw chunk arrays. Trades a memcpy for far less GC pressure and flat RSS. (`ordered-stream` transfers dedicated buffers instead, so this is a no-op there.) See [Buffer pool](#buffer-pool-ordered-drop-memory-strategy-bufferpool). |
 | `consumerRate` | `0` | **ordered-stream only.** Throttle the consumer to this many bytes/sec per object (e.g. `500MiB`), to model a slow reader and exercise backpressure end-to-end. `0` = unlimited. |
@@ -491,6 +492,51 @@ the `download` section:
   "deliveryPath": "/mnt/nvme"       // output dir for "file" mode (default OS temp)
 }
 ```
+
+### Download API (`S3TransferManager`)
+
+By default (`download.api: true`) the benchmark runs through a Transfer-Manager-shaped
+wrapper, `S3TransferManager`. This makes the measurement boundary match a real transfer
+manager's public API: construct once, then call `download()` per object. It always
+delivers to per-object streams, so `deliveryMode` is ignored in this path. Set
+`api:false` / `--no-api` to use the legacy `deliveryMode` run loop instead.
+
+```js
+const tm = new S3TransferManager(cfg);      // spawns the worker pool ONCE (one-time cost)
+await tm.ready();
+
+// single object -> a Readable of the object's bytes, reassembled in PartNumber order
+const { body, contentLength } = await tm.download({ bucket, key });
+await pipeline(body, sink);
+
+// many objects through the SAME pool + global budget (convenience over N download()s)
+const job = await tm.downloadMany({ bucket, keys });
+for (const { key, body } of job.objects) body.pipe(mySink(key));
+await job.done();
+
+await tm.close();
+```
+
+- **One shared pool, objects not pinned.** All objects' parts feed one worker pool; the
+  scheduler round-robins across active objects so every object's frontier advances and
+  the pool stays full. Each object gets its own ordered `Readable`; a part from any
+  worker is routed to its object's stream and pushed in order.
+- **Two-tier backpressure.** A global `maxBufferedBytes` budget bounds the cross-object
+  reorder backlog; each `Readable`'s `streamHwm` throttles a slow consumer per object
+  (a slow reader on one object pauses only that object's fetches).
+- **Buffers are handed to the caller** by ownership transfer (worker → main → the
+  `Readable`) and **not recycled** — once bytes cross the API boundary the caller owns
+  them, so the internal buffer ping-pong (`bufferReturn`) is disabled here.
+- **`download()` vs `downloadMany()`:** identical throughput when `download()` is
+  invoked concurrently and drained concurrently (both feed the one shared scheduler +
+  budget). `downloadMany()` is convenience: hands back all per-object handles up front,
+  plus a `done` promise. Draining **sequentially** is memory-safe but serializes delivery
+  and tanks throughput — always attach all sinks and drain concurrently.
+
+**Harness behavior (default):** each measured iteration fires `x` concurrent
+`download()` calls (`x` = number of objects) and drains their streams concurrently. The
+timed window is "first `download()` → last stream `finish`", so `med`/`best`/`e2e` all
+include HeadObject + planning; only the one-time pool spawn is reported separately.
 
 Notes:
 - **ordered-drop** and **ordered-stream** share the same engine: the main thread
@@ -947,6 +993,7 @@ node src/upload-test-data.js --help   # seed
 | `--keep` | `keep` | Keep bodies in memory instead of draining |
 | `--no-checksum` | `validateChecksum:false` | Disable per-part checksum validation |
 | `--delivery <mode>` | `deliveryMode` | `discard` \| `ordered-drop` \| `ordered-stream` \| `file` |
+| `--no-api` | `api:false` | Disable the default `S3TransferManager` API path and use the legacy `deliveryMode` run loop instead |
 | `--delivery-path <dir>` | `deliveryPath` | Output dir for `file` mode |
 | `--max-buffered <size>` | `maxBufferedBytes` | ordered-stream reorder-buffer cap |
 | `--buffer-pool` | `bufferPool` | ordered-stream: copy into reused contiguous buffers |

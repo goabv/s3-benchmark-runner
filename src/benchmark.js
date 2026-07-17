@@ -12,6 +12,7 @@ import { parseArgs, formatBytes, throughput, isOrderedMode } from './config.js';
 import { ResourceMonitor } from './resource-monitor.js';
 import { renderSvg } from './plot.js';
 import { newProgressBuffer, ProgressReporter } from './progress.js';
+import { S3TransferManager } from './transfer-manager.js';
 import {
   mergeIpThroughput,
   ipIterationGbps,
@@ -632,6 +633,51 @@ function writeTimeseries(cfg, label, tsByIter) {
   console.error(`[timeseries] wrote ${csvPath} and ${svgPath}`);
 }
 
+/**
+ * API-mode run: drive the persistent S3TransferManager exactly as a customer would —
+ * fire one download() per object CONCURRENTLY (x calls for x objects) and drain the
+ * returned per-object Readables CONCURRENTLY. The measured window is the full
+ * "first download() call -> last stream drained" (HEAD + planning are inside it);
+ * the pool is already warm (spawn/init happened in the manager constructor).
+ */
+async function runViaManager(manager, cfg, group, reporter) {
+  manager.resetScheduler();
+  const hwm = cfg.streamHwm > 0 ? cfg.streamHwm : 2 * (1 << 20);
+  const t0 = performance.now();
+  reporter?.start();
+  // x concurrent download() calls (one per object) sharing the one pool + budget.
+  const handles = await Promise.all(group.keys.map((key) => manager.download({ bucket: cfg.bucket, key })));
+  let bytes = 0;
+  // Drain every object's stream concurrently into a discard (optionally throttled) sink.
+  await Promise.all(
+    handles.map(
+      ({ body }) =>
+        new Promise((resolve, reject) => {
+          const sink = new Writable({
+            highWaterMark: hwm,
+            write(chunk, _enc, cb) {
+              bytes += chunk.length;
+              const done = () => {
+                manager.recycle(chunk); // return the buffer to its worker (bufferReturn)
+                cb();
+              };
+              if (cfg.consumerRate > 0) setTimeout(done, (chunk.length / cfg.consumerRate) * 1000);
+              else done();
+            },
+          });
+          body.on('error', reject);
+          sink.on('error', reject);
+          sink.on('finish', resolve);
+          body.pipe(sink);
+        }),
+    ),
+  );
+  const wallMs = performance.now() - t0;
+  reporter?.stop();
+  // deliveredChecksummed/deliveredCount reflect THIS run (resetScheduler zeroed them).
+  return { bytes, wallMs, checksummed: manager.deliveredChecksummed, partsDone: manager.deliveredCount };
+}
+
 async function benchmarkGroup(cfg, group) {
   const control = makeClient({ region: cfg.region });
   // Describe every file in the group. A missing file throws (download "fails if
@@ -741,17 +787,56 @@ async function benchmarkGroup(cfg, group) {
   const progressLabel = infos.length > 1 ? `${groupLabel} x${infos.length}` : groupLabel;
   const makeReporter = () =>
     runCfg.progressBuf ? new ProgressReporter(runCfg.progressBuf, totalBytes, { label: progressLabel }) : null;
+
+  // API mode (DEFAULT): construct the persistent S3TransferManager ONCE (warm pool),
+  // then each iteration fires x concurrent download() calls + concurrent stream
+  // drains. The manager delivers to per-object streams; deliveryMode is ignored here
+  // (set api:false / --no-api to use the legacy deliveryMode run loop instead).
+  const useApi = cfg.api;
+  const manager = useApi
+    ? new S3TransferManager({
+        bucket: cfg.bucket,
+        region: cfg.region,
+        workers: Math.min(cfg.workers, parts.length),
+        concurrency: cfg.concurrency,
+        maxBufferedBytes: cfg.maxBufferedBytes,
+        streamHwm: cfg.streamHwm,
+        bufferReturn: cfg.bufferReturn,
+        validateChecksum: cfg.validateChecksum,
+        httpHandler: cfg.httpHandler,
+        spreadConnections: cfg.spreadConnections,
+        tls: cfg.tls,
+        ciphers: cfg.ciphers,
+        stallTimeoutMs: cfg.stallTimeoutMs,
+        partRetries: cfg.partRetries,
+        partTimes: cfg.partTimes,
+        nativeCrc32: cfg.nativeCrc32,
+        progressBuf: runCfg.progressBuf,
+        logConnections: cfg.logConnections,
+        ipThroughput: runCfg.ipThroughput,
+        profile: cfg.profile,
+        profileDir: cfg.profileDir,
+        consumerRate: cfg.consumerRate,
+      })
+    : null;
+
   const doRun = (reporter) =>
-    isOrderedMode(cfg.deliveryMode) ? runOrdered({ ...runCfg, reporter }) : runOnce({ ...runCfg, reporter });
+    useApi
+      ? runViaManager(manager, cfg, group, reporter)
+      : isOrderedMode(cfg.deliveryMode)
+        ? runOrdered({ ...runCfg, reporter })
+        : runOnce({ ...runCfg, reporter });
 
   let samples;
   let resources;
   let negotiatedTls = null;
   let lastIpCounts = null;
+  let spawnMs = 0;
   const ipHistory = new Map();
   const tsByIter = [];
   const ptByIter = [];
   try {
+    if (manager) await manager.ready(); // one-time pool spawn + client init (untimed)
     for (let i = 0; i < cfg.warmup; i++) {
       await doRun(makeReporter());
     }
@@ -763,13 +848,14 @@ async function benchmarkGroup(cfg, group) {
       const secs = r.wallMs / 1000;
       // e2e denominator = transfer wall + every recurring per-call planning cost:
       // HeadObject (describeMs) + buildParts (buildMs) + assignParts/queue-sort (r.planMs).
-      // One-time costs (worker spawn, client init, data-gen) are intentionally excluded.
-      const planMs = describeMs + buildMs + (r.planMs ?? 0);
+      // One-time costs (worker spawn, client init, data-gen) are excluded. In API mode
+      // the HEAD + planning happen INSIDE the measured wall, so e2e == transfer.
+      const planMs = useApi ? 0 : describeMs + buildMs + (r.planMs ?? 0);
       const e2e = throughput(r.bytes, (r.wallMs + planMs) / 1000);
       samples.push({ ...r, secs, planTotalMs: planMs, ...throughput(r.bytes, secs), e2eGbps: e2e.gbps, e2eMibps: e2e.mibps });
       if (!negotiatedTls && r.tlsInfo) negotiatedTls = r.tlsInfo;
       lastIpCounts = r.ipCounts;
-      if (runCfg.ipThroughput) {
+      if (runCfg.ipThroughput && r.ipThroughput) {
         accumulateIpSamples(ipHistory, ipIterationGbps(new Map(r.ipThroughput)));
       }
       if (runCfg.timeseries && r.timeseries?.length) {
@@ -780,7 +866,19 @@ async function benchmarkGroup(cfg, group) {
       }
     }
     resources = monitor.stop();
+    if (manager) {
+      // Stop + collect pool-wide stats (spawn time, TLS, per-IP, part times).
+      const st = await manager.close();
+      spawnMs = st.spawnMs;
+      if (!negotiatedTls && st.tlsInfo) negotiatedTls = st.tlsInfo;
+      lastIpCounts = st.ipCounts;
+      if (runCfg.ipThroughput && st.ipThroughput?.length) {
+        accumulateIpSamples(ipHistory, ipIterationGbps(new Map(st.ipThroughput)));
+      }
+      if (runCfg.partTimes && st.partTimes?.length) ptByIter.push({ iter: 0, parts: st.partTimes });
+    }
   } finally {
+    if (manager && !manager._closePromise) await manager.close().catch(() => {});
     if (filePaths) for (const fp of Object.values(filePaths)) rmSync(fp, { force: true });
   }
 
@@ -834,6 +932,8 @@ async function benchmarkGroup(cfg, group) {
     concurrency: cfg.concurrency,
     totalInFlight: runCfg.workers * cfg.concurrency,
     iterations: cfg.iterations,
+    api: useApi,
+    spawnMs, // API mode: one-time pool spawn + client init (NOT in any Gbps)
     // Recurring per-call planning costs folded into e2e (all excluded from med/best):
     describeMs, // HeadObject (measured once, attributed per iteration)
     buildMs, // buildParts (measured once)
@@ -875,15 +975,19 @@ function printHuman(cfg, all) {
     : 'HTTP (no TLS)';
   console.log(
     `download unit=PartNumber  handler=${cfg.httpHandler}  transport=${tlsNote}  ` +
-      `delivery=${cfg.deliveryMode}${
-        cfg.deliveryMode === 'ordered-stream'
-          ? ` (max-buffered ${formatBytes(cfg.maxBufferedBytes)}, transfer${cfg.bufferReturn ? '+return' : ''}${cfg.consumerRate > 0 ? `, consumer ${formatBytes(cfg.consumerRate)}/s` : ''})`
-          : cfg.deliveryMode === 'ordered-drop'
-            ? ` (max-buffered ${formatBytes(cfg.maxBufferedBytes)}, buffer-pool ${cfg.bufferPool ? 'ON' : 'OFF'})`
-            : cfg.deliveryMode === 'file'
-              ? ` (writes ${cfg.fileAsync ? `async, UV_THREADPOOL_SIZE=${process.env.UV_THREADPOOL_SIZE ?? '4 (default)'}` : 'sync/blocking'})`
-              : ''
-      }  ` +
+      (all.some((r) => r.api)
+        ? `api=S3TransferManager (x concurrent download() + concurrent drain)  ` +
+          `delivery=stream (per-object Readable, max-buffered ${formatBytes(cfg.maxBufferedBytes)}` +
+          `${cfg.consumerRate > 0 ? `, consumer ${formatBytes(cfg.consumerRate)}/s` : ''})  `
+        : `delivery=${cfg.deliveryMode}${
+            cfg.deliveryMode === 'ordered-stream'
+              ? ` (max-buffered ${formatBytes(cfg.maxBufferedBytes)}, transfer${cfg.bufferReturn ? '+return' : ''}${cfg.consumerRate > 0 ? `, consumer ${formatBytes(cfg.consumerRate)}/s` : ''})`
+              : cfg.deliveryMode === 'ordered-drop'
+                ? ` (max-buffered ${formatBytes(cfg.maxBufferedBytes)}, buffer-pool ${cfg.bufferPool ? 'ON' : 'OFF'})`
+                : cfg.deliveryMode === 'file'
+                  ? ` (writes ${cfg.fileAsync ? `async, UV_THREADPOOL_SIZE=${process.env.UV_THREADPOOL_SIZE ?? '4 (default)'}` : 'sync/blocking'})`
+                  : ''
+          }  `) +
       `checksum validation=${cfg.validateChecksum ? 'ON' : 'OFF'}  ` +
       `spread-conns=${cfg.spreadConnections ? 'ON' : 'OFF'}  ` +
       `workers=${cfg.workers}  concurrency/worker=${cfg.concurrency}  ` +
@@ -913,18 +1017,28 @@ function printHuman(cfg, all) {
     );
   }
   console.log('');
-  console.log(
-    `(med/best Gbps = part transfer only; e2e Gbps also includes the recurring per-call ` +
-      `planning — HeadObject + buildParts + assignParts/sort (worker spawn, client init and ` +
-      `data-gen are one-time and excluded): ` +
-      `${all
-        .map(
-          (r) =>
-            `${r.label} ${(r.planTotalMs ?? 0).toFixed(0)}ms ` +
-            `(head ${(r.describeMs ?? 0).toFixed(0)} + build ${(r.buildMs ?? 0).toFixed(0)} + plan ${(r.planMs ?? 0).toFixed(0)})`,
-        )
-        .join(', ')})`,
-  );
+  if (all.some((r) => r.api)) {
+    // API mode: the whole "download() call -> streams drained" (incl. HeadObject +
+    // planning) is inside med/best/e2e; only the one-time pool spawn is separate.
+    console.log(
+      `(S3TransferManager API: med/best/e2e Gbps = full download() call -> streams drained, ` +
+        `incl. HeadObject + planning. One-time pool spawn + client init (excluded): ` +
+        `${all.map((r) => `${r.label} ${(r.spawnMs ?? 0).toFixed(0)}ms`).join(', ')})`,
+    );
+  } else {
+    console.log(
+      `(med/best Gbps = part transfer only; e2e Gbps also includes the recurring per-call ` +
+        `planning — HeadObject + buildParts + assignParts/sort (worker spawn, client init and ` +
+        `data-gen are one-time and excluded): ` +
+        `${all
+          .map(
+            (r) =>
+              `${r.label} ${(r.planTotalMs ?? 0).toFixed(0)}ms ` +
+              `(head ${(r.describeMs ?? 0).toFixed(0)} + build ${(r.buildMs ?? 0).toFixed(0)} + plan ${(r.planMs ?? 0).toFixed(0)})`,
+          )
+          .join(', ')})`,
+    );
+  }
   printResources(all);
   printPartTimes(all);
   printConnectionsAndIps(all);

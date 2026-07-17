@@ -387,6 +387,13 @@ export function parseArgs(argv = process.argv.slice(2)) {
     // Precedence: --no-checksum (CLI) > "validateChecksum" (section/shared) > true.
     validateChecksum: args['no-checksum'] ? false : (pick('validateChecksum') ?? true),
     deliveryMode,
+    // Route the run through the S3TransferManager API (persistent warm worker pool
+    // constructed once; each iteration calls download() per object concurrently and
+    // drains the returned streams concurrently). This is the DEFAULT download path;
+    // the measured window is the full "download() call -> streams drained" and pool
+    // spawn + client init are one-time and reported separately. Set api:false (or
+    // --no-api) to fall back to the legacy deliveryMode run loop.
+    api: args['no-api'] ? false : (pick('api') ?? true),
     deliveryPath: expandHome(args['delivery-path'] ?? pick('deliveryPath') ?? os.tmpdir()),
     // ordered-stream backpressure: pause new part downloads when the reorder
     // buffer exceeds this many bytes; resume when it drains below half.
