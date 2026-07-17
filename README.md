@@ -179,7 +179,7 @@ A representative config (this repo's current one):
 | `iterations` | `1` | Measured upload runs per size. |
 | `warmup` | `1` | Unmeasured priming run. |
 | `forceUpload` | `false` | If `true`, upload even when a matching object already exists; otherwise skip objects whose size **and** part size already match. |
-| `uploadSource` | `memory` | Where part bytes come from: `memory` (pre-built buffer, generation excluded from timing), `file` (read each part from disk inline — measures disk + upload),, `stream` (the customer hands one `Readable` per object to main; main carves + transfers parts to a pool of uploader threads), or `open` (the customer passes a re-openable source descriptor; each worker opens its own stream for its part range — distributes ingress across cores). See the Data source section below. |
+| `uploadSource` | `memory` | Where part bytes come from: `memory` (one object-sized `SharedArrayBuffer` per object, filled once; parts are zero-copy views — resident memory = sum of object sizes, preflight-guarded), `file` (read each part from disk inline — measures disk + upload), `stream` (the customer hands one `Readable` per object to main; main carves + transfers parts to a pool of uploader threads), `open` (the customer passes a re-openable source descriptor; each worker opens its own stream for its part range — distributes ingress across cores), or `open-stream` (carver threads open whole-object streams, a separate uploader pool sends). See the Data source section below. |
 | `uploadOpen` | `{ "type": "file" }` | **open / open-stream only.** The source descriptor: `{ "type": "file" }` (read the shared source file), `{ "type": "memory" }` (generate bytes in-memory on each worker — no disk, fastest ingress). Fixed built-in openers only. |
 | `uploadCarvers` | `0` (auto) | **open-stream only.** Number of carver threads. `0` = one per object; set lower to put multiple objects on each carver (they're carved sequentially). Carvers + uploaders (`workers`) are separate pools, so total threads ≈ `carvers + workers`. |
 | `uploadMaxBuffered` | `0` (auto) | **stream source only.** Cap (bytes) on carved-but-not-yet-uploaded parts held on main (the dispatch queue). Bounds memory and gives the uploader pool a surplus to pull from; when full, main pauses reading the customer stream (backpressure). `0` = auto (`workers × concurrency + 1` parts). |
@@ -311,12 +311,12 @@ complete), not just the part transfer.
 **Data source** — set `uploadSource` in the `upload` section:
 
 ```json
-"upload": { "uploadSource": "memory" }   // or "file" | "stream"
+"upload": { "uploadSource": "memory" }   // or "file" | "stream" | "open" | "open-stream"
 ```
 
 | `uploadSource` | What it does | Measures |
 |--------|--------------|----------|
-| `memory` (default) | Upload from a pre-built in-memory random buffer, generated **before** timing starts | Pure network + CPU (checksum) upload cost |
+| `memory` (default) | Allocate one **object-sized `SharedArrayBuffer` per object** up front (untimed), random-filled once and shared across the whole worker pool. Every part is a **zero-copy view** into its object's buffer | Pure network + CPU (checksum) upload cost. **Resident memory = sum of all object sizes**, so it only fits when that sum is under box RAM (preflight-guarded; fails fast otherwise) |
 | `file` | Read each part from a local file during upload, inline with the send loop (a blocking `readSync`, so the worker's event loop stalls during each read) | Disk read + upload, serialized |
 | `stream` | The customer hands one `Readable` per object to **main**; main reads it, carves + fills part buffers, and **transfers** each part (zero-copy) to a pool of **uploader worker threads** that `UploadPart` in parallel, out of order | Transfer-Manager-style streaming upload: single-thread ingress + fanned-out parallel upload |
 | `open` | The customer passes a re-openable source **descriptor** (factory pattern), not a live stream; **each worker opens its own stream** for its part's byte range and uploads it | Distributed ingress — reading is fanned across worker threads (no single-thread main funnel), for range-addressable sources |

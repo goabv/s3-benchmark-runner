@@ -11,10 +11,11 @@ import { bumpProgress, progressView } from './progress.js';
 /**
  * Worker thread for the S3 multipart UPLOAD benchmark. Two roles:
  *
- *  - SLICE mode (uploadSource 'memory' | 'file'): the worker owns a fixed slice of
- *    parts and uploads them with up to `concurrency` parallel UploadPart calls,
- *    sourcing bytes from a pre-built in-memory buffer (memory) or reading them from
- *    a shared source file (file). Protocol: main->worker 'start'; worker->main 'done'.
+ *  - SLICE mode (uploadSource 'memory' | 'file' | 'open'): the worker owns a fixed
+ *    slice of parts and uploads them with up to `concurrency` parallel UploadPart
+ *    calls, sourcing bytes from a per-object SharedArrayBuffer shared from main
+ *    (memory, zero-copy view), a shared source file (file), or a per-worker opener
+ *    (open). Protocol: main->worker 'start'; worker->main 'done'.
  *
  *  - POOL mode (uploadSource 'stream'): the worker is a generic uploader. The main
  *    thread carves the customer stream into part buffers and TRANSFERS them here
@@ -36,6 +37,7 @@ const {
   role, // 'carver' | 'uploader' (open-stream two-tier); undefined = single-tier
   sourceFilePath, // for uploadSource === 'file'
   openDesc, // for uploadSource === 'open'(-stream): { type:'file', path } | { type:'memory', chunk }
+  objectBuffers, // for uploadSource === 'memory': { key -> SharedArrayBuffer } (shared, zero-copy)
   carverObjects, // carver role: [{ key, uploadId(set on carve), size, baseParts }]
   carverLimit = 1, // carver role: max outstanding (un-acked) parts before pausing
   spreadConnections,
@@ -45,7 +47,7 @@ const {
   ciphers, // OpenSSL cipher string to pin the TLS suite (null = defaults)
   nativeCrc32, // patch @aws-crypto/crc32 to use native zlib.crc32
   workerId = 0, // only worker 0 logs the native-crc32 status (avoid N-way spam)
-  maxPartSize = 0, // slice mode: size the pre-gen buffer at spawn (parts arrive on 'start')
+  maxPartSize = 0, // carver/uploader pool: size the recycled part buffers
   progressBuf, // shared byte counter for the live progress indicator (or null)
 } = workerData;
 
@@ -232,13 +234,12 @@ else if (role === 'uploader' || uploadSource === 'stream') {
   parentPort.postMessage({ type: 'ready' });
 } else {
   // -------------------------------------------------------------------------
-  // SLICE mode (uploadSource 'memory' | 'file').
+  // SLICE mode (uploadSource 'memory' | 'file' | 'open').
   // -------------------------------------------------------------------------
-  // memory: pre-generate one random buffer sized to the part size, BEFORE signalling
-  //   ready, so buffer creation is excluded from timing (main starts the clock only
-  //   after every worker is ready). Parts arrive later, in the 'start' message.
+  // memory: one object-sized SharedArrayBuffer per object is allocated + filled on
+  //   main (untimed) and shared here by reference; each part is a zero-copy view.
   // file:   open the source file; part bytes are read on demand during the timed run.
-  let buffer = null;
+  // open:   resolve a per-worker opener; each part opens its own byte-range stream.
   let fd = null;
   let openStream = null; // (part) => Readable, for uploadSource === 'open'
   if (uploadSource === 'file') {
@@ -254,10 +255,10 @@ else if (role === 'uploader' || uploadSource === 'stream') {
       openStream = (part) =>
         createReadStream(openDesc.path, { start: part.start, end: part.start + part.size - 1 }); // end inclusive
     }
-  } else {
-    buffer = Buffer.allocUnsafe(maxPartSize);
-    if (maxPartSize > 0) randomFillSync(buffer);
   }
+  // memory: object-sized SharedArrayBuffers were allocated + filled on main and are
+  // shared here by reference (no copy, no per-worker allocation). Each part is a
+  // zero-copy Buffer view into its object's buffer — nothing to set up per worker.
 
   // materialize the body, then send.
   async function uploadPart(part) {
@@ -281,7 +282,8 @@ else if (role === 'uploader' || uploadSource === 'stream') {
       for await (const c of rs) chunks.push(c);
       body = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, size);
     } else {
-      body = size === buffer.length ? buffer : buffer.subarray(0, size);
+      // memory: zero-copy view into this object's shared buffer at its part range.
+      body = Buffer.from(objectBuffers[part.key], start, size);
     }
     return sendPartBody(part, body);
   }

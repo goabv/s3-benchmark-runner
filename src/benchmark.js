@@ -834,6 +834,18 @@ async function benchmarkGroup(cfg, group) {
 function printHuman(cfg, all) {
   console.log('\n=== S3 part-boundary download benchmark (AWS SDK JS v3) ===');
   console.log(`node=${process.version}  sdk=@aws-sdk/client-s3@${SDK_VERSION}  @smithy/core@${SMITHY_CORE_VERSION}`);
+
+  if (all.length === 0) {
+    console.log(
+      `\nNo results: every size group failed. See the [error] line(s) above for the cause.\n` +
+        (cfg.deliveryMode === 'file'
+          ? `In 'file' mode each part is written to disk under deliveryPath=${cfg.deliveryPath}. ` +
+            `The full working set is the entire download size; a common failure is the volume ` +
+            `running out of space (ENOSPC). Point deliveryPath at a volume with room.\n`
+          : ''),
+    );
+    return;
+  }
   console.log(`region=${cfg.region ?? '(default)'}  bucket=${cfg.bucket}`);
   const tlsNote = cfg.tls
     ? (() => {

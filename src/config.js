@@ -545,7 +545,12 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
   const prefix = args.prefix ?? pick('dataPrefix') ?? '';
   const groups = sizeGroups(prefix, rawSizes);
 
-  // memory - reuse one pre-filled buffer per worker (pure network ceiling)
+  // memory - allocate ONE object-sized SharedArrayBuffer per object up front
+  //          (untimed), random-filled once and shared across the whole worker pool.
+  //          Every part is a zero-copy view into its object's buffer. RESIDENT
+  //          memory = sum of all object sizes, so it only fits when that sum is
+  //          under box RAM (preflight-guarded). Models a customer who already has
+  //          whole objects in memory and hands them to the transfer manager.
   // file   - read each part from a shared source file on demand (blocking readSync)
   // stream - the customer hands ONE Readable per object to the main thread; main
   //          reads it, carves + fills part buffers (single-thread ingress), and

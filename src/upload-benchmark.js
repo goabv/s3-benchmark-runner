@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { writeFileSync, mkdirSync, createWriteStream, rmSync } from 'node:fs';
 import { randomFillSync } from 'node:crypto';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import {
   CreateMultipartUploadCommand,
@@ -81,7 +82,7 @@ function completedPart(r) {
  * Excludes worker spawn + client init + data generation (ready/start handshake),
  * so it measures only the parallel UploadPart data transfer.
  */
-function runOnce({ bucket, region, baseParts, keys, workers, concurrency, checksum, maxSockets, uploadSource, sourceFilePath, openDesc, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32, progressBuf, reporter, onCreate, onComplete }) {
+function runOnce({ bucket, region, baseParts, keys, workers, concurrency, checksum, maxSockets, uploadSource, sourceFilePath, openDesc, objectBuffers, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32, progressBuf, reporter, onCreate, onComplete }) {
   const totalParts = baseParts.length * keys.length;
   const nWorkers = Math.max(1, Math.min(workers, totalParts));
   const partSizeMax = baseParts.reduce((m, p) => Math.max(m, p.size), 0);
@@ -125,7 +126,7 @@ function runOnce({ bucket, region, baseParts, keys, workers, concurrency, checks
       const worker = new Worker(WORKER_PATH, {
         workerData: {
           bucket, region, concurrency, checksum, maxSockets, maxPartSize: partSizeMax,
-          uploadSource, sourceFilePath, openDesc, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32,
+          uploadSource, sourceFilePath, openDesc, objectBuffers, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32,
           workerId: wi, progressBuf,
         },
       });
@@ -575,7 +576,7 @@ function runOpenStreamUpload({
  * window then spans the whole multipart lifecycle: CreateMultipartUpload -> parallel
  * UploadPart -> CompleteMultipartUpload, so the reported throughput is end-to-end.
  */
-async function uploadIterationGroup(control, cfg, keys, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf = null, reporter = null) {
+async function uploadIterationGroup(control, cfg, keys, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf = null, reporter = null, objectBuffers = null) {
   const uploadIds = {};
 
   // Create one MPU per key and build the pooled part list (key + uploadId tagged).
@@ -658,6 +659,7 @@ async function uploadIterationGroup(control, cfg, keys, baseParts, maxSockets, s
     reporter,
     onCreate,
     onComplete,
+    objectBuffers,
   };
 
   try {
@@ -676,6 +678,48 @@ async function uploadIterationGroup(control, cfg, keys, baseParts, maxSockets, s
     await abortAll();
     throw err;
   }
+}
+
+/**
+ * 'memory' source: allocate ONE object-sized SharedArrayBuffer per object (shared
+ * by reference across the whole worker pool — no copy on transfer) and random-fill
+ * each once. Parts become zero-copy views into their object's buffer.
+ *
+ * Resident memory = sum of all object sizes, so we preflight against box RAM and
+ * fail fast (rather than OOM mid-run). Allocation + fill is UNTIMED.
+ */
+function allocObjectBuffers(keys, size, { json } = {}) {
+  const total = size * keys.length;
+  const totalMem = os.totalmem();
+  // Leave headroom for the SDK/undici socket buffers, V8 heap, and the OS.
+  const budget = Math.floor(totalMem * 0.8);
+  if (total > budget) {
+    throw new Error(
+      `memory source needs ${formatBytes(total)} resident (${keys.length} x ${formatBytes(size)}), ` +
+        `but only ~${formatBytes(budget)} of ${formatBytes(totalMem)} RAM is available for buffers. ` +
+        `Reduce object size or count (e.g. fewer files, or a smaller size), or use uploadSource ` +
+        `"open"/"stream" (no full-object residency).`,
+    );
+  }
+  if (!json) {
+    console.error(
+      `[setup] allocating ${keys.length} x ${formatBytes(size)} = ${formatBytes(total)} object buffer(s), ` +
+        `random-filling (untimed) ...`,
+    );
+  }
+  const buffers = {};
+  // randomFillSync bounds BOTH its offset and size args by 2^31-1, so fill through a
+  // zero-based sub-view per chunk (Buffer.from accepts large byte offsets) rather
+  // than passing an absolute offset into a >2 GiB buffer.
+  const FILL_CHUNK = 1 << 30; // 1 GiB, safely under the 2^31-1 size limit
+  for (const key of keys) {
+    const sab = new SharedArrayBuffer(size);
+    for (let off = 0; off < size; off += FILL_CHUNK) {
+      randomFillSync(Buffer.from(sab, off, Math.min(FILL_CHUNK, size - off)));
+    }
+    buffers[key] = sab;
+  }
+  return buffers;
 }
 
 async function benchmarkGroup(cfg, group) {
@@ -741,8 +785,13 @@ async function benchmarkGroup(cfg, group) {
       await writeRandomFile(sourceFilePath, bytes);
     }
 
+    // 'memory': one object-sized SharedArrayBuffer per object, filled once and
+    // reused across warmup + timed iterations (allocation is untimed).
+    const objectBuffers =
+      cfg.uploadSource === 'memory' ? allocObjectBuffers(keysToUpload, bytes, { json: cfg.json }) : null;
+
     for (let i = 0; i < cfg.warmup; i++) {
-      await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, makeReporter());
+      await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, makeReporter(), objectBuffers);
     }
 
     const monitor = new ResourceMonitor();
@@ -750,7 +799,7 @@ async function benchmarkGroup(cfg, group) {
     const samples = [];
     let negotiatedTls = null;
     for (let i = 0; i < cfg.iterations; i++) {
-      const r = await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, makeReporter());
+      const r = await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, makeReporter(), objectBuffers);
       const secs = r.wallMs / 1000;
       samples.push({ secs, ...throughput(r.bytes, secs) });
       if (!negotiatedTls && r.tlsInfo) negotiatedTls = r.tlsInfo;
@@ -831,7 +880,9 @@ function printHuman(cfg, all) {
           ? ` (worker-open ${cfg.uploadOpen?.type ?? 'file'})`
           : cfg.uploadSource === 'open-stream'
             ? ` (carvers${cfg.uploadCarvers > 0 ? ` x${cfg.uploadCarvers}` : ' auto'} -> uploaders x${cfg.workers}, ${cfg.uploadOpen?.type ?? 'file'})`
-            : ''
+            : cfg.uploadSource === 'memory'
+              ? ` (one SharedArrayBuffer per object, zero-copy part views)`
+              : ''
     }  ` +
       `handler=${cfg.httpHandler}  transport=${uploadTlsNote(cfg, all)}  ` +
       `part-size=${formatBytes(cfg.partSize)}  checksum=${cfg.checksum || 'off'}  ` +
