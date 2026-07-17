@@ -2,6 +2,10 @@ node_modules/
 *.log
 .env
 
+# Sibling Go project scaffolded here due to workspace sandbox; it's its own
+# self-contained module/repo and must not be tracked by this repo.
+s3-benchmark-go/
+
 # Large data / scratch artifacts never belong in git.
 *.bin
 

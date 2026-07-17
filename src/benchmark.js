@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Worker } from 'node:worker_threads';
+import { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { writeFileSync, mkdirSync, openSync, ftruncateSync, closeSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -7,9 +8,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { HeadObjectCommand } from '@aws-sdk/client-s3';
 import { makeClient } from './s3.js';
-import { parseArgs, formatBytes, throughput } from './config.js';
+import { parseArgs, formatBytes, throughput, isOrderedMode } from './config.js';
 import { ResourceMonitor } from './resource-monitor.js';
 import { renderSvg } from './plot.js';
+import { newProgressBuffer, ProgressReporter } from './progress.js';
 import {
   mergeIpThroughput,
   ipIterationGbps,
@@ -94,7 +96,7 @@ async function describeObject(client, bucket, key) {
  * `ready`, then broadcast `start` and time until the last `done`.
  */
 // SLICE mode (discard / file): each worker owns a fixed slice and runs freely.
-function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets, validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler, ciphers, stallTimeoutMs, partRetries, partTimes, fileAsync, profile, profileDir, nativeCrc32 }) {
+function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets, validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler, ciphers, stallTimeoutMs, partRetries, partTimes, fileAsync, profile, profileDir, nativeCrc32, progressBuf, reporter }) {
   const buckets = assignParts(parts, workers).filter((b) => b.length > 0);
   const active = buckets.length;
 
@@ -113,7 +115,10 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
       if (arr) for (const [ip, c] of arr) runIp.set(ip, (runIp.get(ip) || 0) + c);
     };
 
-    const cleanup = () => threads.forEach((w) => w.terminate());
+    const cleanup = () => {
+      reporter?.stop();
+      threads.forEach((w) => w.terminate());
+    };
     const fail = (err) => {
       if (settled) return;
       settled = true;
@@ -128,7 +133,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
           bucket, region, parts: slice, concurrency, keep, maxSockets,
           validateChecksum, deliveryMode, filePaths, logConnections, spreadConnections, tls, ipThroughput, httpHandler,
           ciphers, stallTimeoutMs, partRetries, partTimes, workerId: sliceIdx++, fileAsync,
-          profile, profileDir, nativeCrc32,
+          profile, profileDir, nativeCrc32, progressBuf,
         },
       });
       threads.push(worker);
@@ -136,6 +141,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
         if (msg.type === 'ready') {
           if (++readyCount === active) {
             startTime = performance.now();
+            reporter?.start();
             threads.forEach((w) => w.postMessage({ type: 'start' }));
           }
         } else if (msg.type === 'done') {
@@ -147,6 +153,7 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
           if (++doneCount === active && !settled) {
             settled = true;
             const wallMs = performance.now() - startTime;
+            reporter?.stop();
             cleanup();
             resolve({
               bytes: results.reduce((s, r) => s + r.bytes, 0),
@@ -179,13 +186,31 @@ function runOnce({ bucket, region, parts, workers, concurrency, keep, maxSockets
  * dispatches the next part regardless of the cap (bounded one-part overshoot),
  * so the part delivery is waiting on is always fetched.
  */
-function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, validateChecksum, logConnections, spreadConnections, tls, ipThroughput, maxBufferedBytes, httpHandler, ciphers, timeseries, stallTimeoutMs, partRetries, partTimes, bufferPool, profile, profileDir, nativeCrc32 }) {
+function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, validateChecksum, logConnections, spreadConnections, tls, ipThroughput, maxBufferedBytes, httpHandler, ciphers, timeseries, stallTimeoutMs, partRetries, partTimes, bufferPool, deliveryMode, consumerRate = 0, bufferReturn = true, streamHwm: streamHwmCfg = 0, profile, profileDir, nativeCrc32, progressBuf, reporter }) {
   const queue = [...parts].sort(
     (a, b) => a.partNumber - b.partNumber || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
   );
   const totalParts = queue.length;
   const nWorkers = Math.max(1, Math.min(workers, totalParts));
   const cap = maxBufferedBytes > 0 ? maxBufferedBytes : Infinity;
+
+  // ordered-stream: deliver ordered bytes into a per-object Readable a consumer
+  // drains. ordered-drop: only account + free bytes in the worker (no consumer).
+  const streamSink = deliveryMode === 'ordered-stream';
+  // Parts per object key — lets the sink push(null) when an object is complete.
+  const partsPerKey = new Map();
+  for (const p of queue) partsPerKey.set(p.key, (partsPerKey.get(p.key) || 0) + 1);
+  const totalKeys = partsPerKey.size;
+  // Per-object Readable + its backpressure state (stream sink only).
+  const streams = new Map(); // key -> { readable, paused }
+  // Transferred, completed-but-undelivered part buffers (stream sink only).
+  // id -> { buf: Buffer, byteLength, hasChecksum, wi }
+  const heldBuffers = new Map();
+  let streamsFinished = 0; // objects whose consumer has fully drained them
+  // Consumer highWaterMark (per-object Readable + its sink). Configurable via
+  // `download.streamHwm`; defaults to a couple of parts' worth so a normal (fast)
+  // consumer never blocks, while a throttled one still exerts real backpressure.
+  const streamHwm = streamHwmCfg > 0 ? streamHwmCfg : Math.max(1 << 20, 2 * (queue[0]?.size ?? 1 << 20));
 
   return new Promise((resolve, reject) => {
     const threads = [];
@@ -242,6 +267,7 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
     let workerDone = 0;
 
     const cleanup = () => {
+      reporter?.stop();
       if (tsTimer) clearInterval(tsTimer);
       threads.forEach((w) => w.terminate());
     };
@@ -269,7 +295,90 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
       }
     };
 
+    let consumedBytes = 0;
+
+    // --- Stream sink: per-object Readable + a draining consumer --------------
+    // Build a Writable that "consumes" each delivered chunk (optionally throttled
+    // to consumerRate to model a slow reader), then transfers the buffer back to
+    // its owning worker for reuse (bounded, zero-copy both ways).
+    const makeSink = () =>
+      new Writable({
+        highWaterMark: streamHwm,
+        write(chunk, _enc, cb) {
+          consumedBytes += chunk.length;
+          const wi = chunk.__wi;
+          const ab = chunk.buffer;
+          const finishChunk = () => {
+            if (bufferReturn && wi !== undefined && threads[wi]) {
+              try {
+                threads[wi].postMessage({ type: 'return', buffer: ab }, [ab]);
+              } catch {
+                /* worker already stopped — buffer will just be GC'd */
+              }
+            }
+            cb();
+          };
+          if (consumerRate > 0) setTimeout(finishChunk, (chunk.length / consumerRate) * 1000);
+          else finishChunk();
+        },
+      });
+
+    const ensureStream = (key) => {
+      let s = streams.get(key);
+      if (s) return s;
+      s = { paused: false, readable: null };
+      s.readable = new Readable({
+        highWaterMark: streamHwm,
+        read() {
+          // Consumer wants more: lift backpressure, deliver + fetch more.
+          if (s.paused) {
+            s.paused = false;
+            drainKey(key);
+            dispatchMore();
+          }
+        },
+      });
+      streams.set(key, s);
+      s.readable.pipe(makeSink()).on('finish', () => {
+        streamsFinished += 1;
+        if (streamsFinished === totalKeys && !deliveryDone) {
+          deliveryDone = true;
+          deliveryWallMs = performance.now() - startTime;
+          threads.forEach((w) => w.postMessage({ type: 'stop' }));
+        }
+        maybeResolve();
+      });
+      return s;
+    };
+
+    const drainKeyStream = (key) => {
+      const s = ensureStream(key);
+      if (s.paused) return;
+      let n = nextByKey.get(key) ?? 1;
+      let id = `${key}#${n}`;
+      while (heldBuffers.has(id)) {
+        const info = heldBuffers.get(id);
+        const buf = info.buf;
+        buf.__wi = info.wi; // remember owner for return-credit after consumption
+        heldBuffers.delete(id);
+        bufferedBytes -= info.byteLength;
+        deliveredBytes += info.byteLength;
+        if (info.hasChecksum) deliveredChecksummed += 1;
+        deliveredCount += 1;
+        n += 1;
+        id = `${key}#${n}`;
+        const ok = s.readable.push(buf);
+        if (n > partsPerKey.get(key)) s.readable.push(null); // object complete -> EOF
+        if (!ok) {
+          s.paused = true; // HWM hit: stop pushing until the consumer reads
+          break;
+        }
+      }
+      nextByKey.set(key, n);
+    };
+
     const drainKey = (key) => {
+      if (streamSink) return drainKeyStream(key);
       let n = nextByKey.get(key) ?? 1;
       let id = `${key}#${n}`;
       while (heldMeta.has(id)) {
@@ -314,9 +423,10 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
       const worker = new Worker(WORKER_PATH, {
         workerData: {
           bucket, region, parts: [], concurrency, maxSockets, validateChecksum,
-          deliveryMode: 'ordered-stream', logConnections, spreadConnections, tls, ipThroughput, httpHandler,
+          deliveryMode, logConnections, spreadConnections, tls, ipThroughput, httpHandler,
           ciphers, stallTimeoutMs, partRetries, partTimes, workerId: wi, bufferPool,
-          profile, profileDir, nativeCrc32,
+          bufferReturn,
+          profile, profileDir, nativeCrc32, progressBuf,
         },
       });
       threads.push(worker);
@@ -324,6 +434,7 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
         if (msg.type === 'ready') {
           if (++readyCount === nWorkers) {
             startTime = performance.now();
+            reporter?.start();
             if (timeseries) {
               lastCpu = process.cpuUsage();
               lastCpuAt = process.hrtime.bigint();
@@ -336,6 +447,31 @@ function runOrdered({ bucket, region, parts, workers, concurrency, maxSockets, v
         } else if (msg.type === 'part-ready') {
           // Metadata only; the worker holds the bytes until we 'release' them.
           heldMeta.set(`${msg.key}#${msg.partNumber}`, {
+            byteLength: msg.byteLength,
+            hasChecksum: msg.hasChecksum,
+            wi,
+          });
+          if (partTimes && msg.downloadMs !== undefined) {
+            runPartTimes.push({
+              key: msg.key,
+              partNumber: msg.partNumber,
+              bytes: msg.byteLength,
+              ms: msg.downloadMs,
+              vip: msg.vip ?? null,
+              connId: msg.connId ?? null,
+            });
+          }
+          bufferedBytes += msg.byteLength;
+          freeLanes[wi] += 1;
+          totalInFlight -= 1;
+          drainKey(msg.key);
+          dispatchMore();
+        } else if (msg.type === 'part') {
+          // Stream sink: the worker TRANSFERRED the part's bytes (zero-copy). Hold
+          // the buffer as the reorder backlog until it can be pushed in order.
+          const buf = Buffer.from(msg.buffer, 0, msg.byteLength);
+          heldBuffers.set(`${msg.key}#${msg.partNumber}`, {
+            buf,
             byteLength: msg.byteLength,
             hasChecksum: msg.hasChecksum,
             wi,
@@ -572,17 +708,26 @@ async function benchmarkGroup(cfg, group) {
     partTimes: cfg.partTimes,
     fileAsync: cfg.fileAsync,
     nativeCrc32: cfg.nativeCrc32,
-    // Time series only makes sense for ordered-stream (buffered/in-flight counts
+    // Time series only makes sense for ordered modes (buffered/in-flight counts
     // are centrally tracked there); ignored by runOnce.
-    timeseries: cfg.timeseries && cfg.deliveryMode === 'ordered-stream',
-    // Buffer pool is an ordered-stream-only memory strategy.
-    bufferPool: cfg.bufferPool && cfg.deliveryMode === 'ordered-stream',
+    timeseries: cfg.timeseries && isOrderedMode(cfg.deliveryMode),
+    // Buffer pool is an ordered-drop memory strategy (ordered-stream transfers
+    // dedicated buffers instead, so it's a no-op there).
+    bufferPool: cfg.bufferPool && isOrderedMode(cfg.deliveryMode),
+    consumerRate: cfg.consumerRate,
+    bufferReturn: cfg.bufferReturn,
+    streamHwm: cfg.streamHwm,
     profile: cfg.profile,
     profileDir: cfg.profileDir,
+    progressBuf: cfg.progress && !cfg.json ? newProgressBuffer() : null,
   };
   if (cfg.profile) mkdirSync(cfg.profileDir, { recursive: true });
 
-  const doRun = () => (cfg.deliveryMode === 'ordered-stream' ? runOrdered(runCfg) : runOnce(runCfg));
+  const progressLabel = infos.length > 1 ? `${groupLabel} x${infos.length}` : groupLabel;
+  const makeReporter = () =>
+    runCfg.progressBuf ? new ProgressReporter(runCfg.progressBuf, totalBytes, { label: progressLabel }) : null;
+  const doRun = (reporter) =>
+    isOrderedMode(cfg.deliveryMode) ? runOrdered({ ...runCfg, reporter }) : runOnce({ ...runCfg, reporter });
 
   let samples;
   let resources;
@@ -593,13 +738,13 @@ async function benchmarkGroup(cfg, group) {
   const ptByIter = [];
   try {
     for (let i = 0; i < cfg.warmup; i++) {
-      await doRun();
+      await doRun(makeReporter());
     }
     const monitor = new ResourceMonitor();
     monitor.start();
     samples = [];
     for (let i = 0; i < cfg.iterations; i++) {
-      const r = await doRun();
+      const r = await doRun(makeReporter());
       const secs = r.wallMs / 1000;
       samples.push({ ...r, secs, ...throughput(r.bytes, secs) });
       if (!negotiatedTls && r.tlsInfo) negotiatedTls = r.tlsInfo;
@@ -695,10 +840,12 @@ function printHuman(cfg, all) {
     `download unit=PartNumber  handler=${cfg.httpHandler}  transport=${tlsNote}  ` +
       `delivery=${cfg.deliveryMode}${
         cfg.deliveryMode === 'ordered-stream'
-          ? ` (max-buffered ${formatBytes(cfg.maxBufferedBytes)}, buffer-pool ${cfg.bufferPool ? 'ON' : 'OFF'})`
-          : cfg.deliveryMode === 'file'
-            ? ` (writes ${cfg.fileAsync ? `async, UV_THREADPOOL_SIZE=${process.env.UV_THREADPOOL_SIZE ?? '4 (default)'}` : 'sync/blocking'})`
-            : ''
+          ? ` (max-buffered ${formatBytes(cfg.maxBufferedBytes)}, transfer${cfg.bufferReturn ? '+return' : ''}${cfg.consumerRate > 0 ? `, consumer ${formatBytes(cfg.consumerRate)}/s` : ''})`
+          : cfg.deliveryMode === 'ordered-drop'
+            ? ` (max-buffered ${formatBytes(cfg.maxBufferedBytes)}, buffer-pool ${cfg.bufferPool ? 'ON' : 'OFF'})`
+            : cfg.deliveryMode === 'file'
+              ? ` (writes ${cfg.fileAsync ? `async, UV_THREADPOOL_SIZE=${process.env.UV_THREADPOOL_SIZE ?? '4 (default)'}` : 'sync/blocking'})`
+              : ''
       }  ` +
       `checksum validation=${cfg.validateChecksum ? 'ON' : 'OFF'}  ` +
       `spread-conns=${cfg.spreadConnections ? 'ON' : 'OFF'}  ` +

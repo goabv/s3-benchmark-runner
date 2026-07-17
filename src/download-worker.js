@@ -10,6 +10,7 @@ const writevAsync = promisify(writevCb);
 import { makeClient } from './s3.js';
 import { IpThroughputTracker } from './ip-throughput.js';
 import { installNativeCrc32 } from './crc32-native.mjs';
+import { bumpProgress, progressView } from './progress.js';
 
 /**
  * Worker thread: downloads parts by PartNumber. Each part carries its own object
@@ -49,20 +50,27 @@ const {
   partRetries, // max stall-retries per part before giving up
   partTimes, // when true, record per-part download wall time (+ vip/conn id) and report it
   workerId = 0, // index of this worker, used to make connection ids globally unique
-  bufferPool, // ordered-stream: copy chunks into reused contiguous part buffers
+  bufferPool, // ordered-drop: copy chunks into reused contiguous part buffers
+  bufferReturn = true, // ordered-stream: reuse dedicated buffers handed back by main
   fileAsync, // file mode: write each part asynchronously (don't block the event loop)
   profile, // when true, CPU-profile this worker and write a .cpuprofile
   profileDir, // directory for the per-worker .cpuprofile files
   nativeCrc32, // patch @aws-crypto/crc32 to use native zlib.crc32
+  progressBuf, // shared byte counter for the live progress indicator (or null)
 } = workerData;
 
+const progress = progressView(progressBuf);
+
 // Confirm (or, for older SDKs, force) native zlib.crc32 for CRC32 before any
-// request creates a checksum instance.
+// request creates a checksum instance. The routine "already native" case is
+// silent; only worker 0 surfaces an actual patch or a failure to ensure native
+// (so this doesn't print once per worker).
 if (nativeCrc32) {
   const r = await installNativeCrc32();
-  if (r.patched) console.error(`[native-crc32] patched: ${r.reason}`);
-  else if (r.alreadyNative) console.error(`[native-crc32] no patch needed: ${r.reason}`);
-  else console.error(`[native-crc32] not applied: ${r.reason}`);
+  if (workerId === 0) {
+    if (r.patched) console.error(`[native-crc32] patched: ${r.reason}`);
+    else if (!r.alreadyNative) console.error(`[native-crc32] not applied: ${r.reason}`);
+  }
 }
 
 // Optional per-worker CPU profiler (find where a worker spends its time — e.g. to
@@ -309,6 +317,7 @@ async function runSlice() {
       const t0 = performance.now();
       const { bytes, hasChecksum, vip, connId } = await downloadPart(part);
       const ms = performance.now() - t0;
+      bumpProgress(progress, bytes);
       totalBytes += bytes;
       partsDone += 1;
       if (hasChecksum) checksummed += 1;
@@ -349,6 +358,22 @@ function releaseBuf(buf) {
   if (buf) bufPool.push(buf);
 }
 
+// Stream sink: the worker assembles each part into a DEDICATED ArrayBuffer and
+// transfers it (zero-copy) to main. With bufferReturn, main transfers consumed
+// ArrayBuffers back here, so a bounded set of buffers ping-pongs across the
+// thread boundary instead of allocating one per part.
+const streamMode = deliveryMode === 'ordered-stream';
+const returnedBufs = []; // ArrayBuffers handed back by main, available for reuse
+function acquireArrayBuffer(size) {
+  if (bufferReturn) {
+    for (let i = 0; i < returnedBufs.length; i++) {
+      if (returnedBufs[i].byteLength >= size) return returnedBufs.splice(i, 1)[0];
+    }
+  }
+  // allocUnsafeSlow -> its own (non-pooled) ArrayBuffer, safe to transfer wholesale.
+  return Buffer.allocUnsafeSlow(size).buffer;
+}
+
 let dispatchInFlight = 0;
 let dispatchStopped = false;
 let dPartsDone = 0;
@@ -370,22 +395,65 @@ async function dispatchMaybeDone() {
     });
     heldChunks.clear();
     bufPool.length = 0;
+    returnedBufs.length = 0;
     closeFds();
     client.destroy();
   }
 }
 
-if (deliveryMode === 'ordered-stream') {
+if (deliveryMode === 'ordered-stream' || deliveryMode === 'ordered-drop') {
   parentPort.on('message', async (msg) => {
     if (msg?.type === 'assign') {
       dispatchInFlight += 1;
       try {
         const label = `${msg.part.key}#${msg.part.partNumber}`;
         const t0 = performance.now();
-        let held = null; // chunk[] (default) or a pooled Buffer (bufferPool)
         let byteLength = 0;
         let vip = null;
         let connId = null;
+
+        if (streamMode) {
+          // Assemble the part into a dedicated ArrayBuffer, then TRANSFER it to
+          // main (zero-copy) for in-order delivery into a per-object Readable.
+          const ab = acquireArrayBuffer(msg.part.size);
+          const view = Buffer.from(ab, 0, msg.part.size);
+          const hasChecksum = await withStallRetry(label, async (signal, bump) => {
+            const got = await getPart(msg.part, signal);
+            vip = got.vip;
+            connId = got.connId;
+            byteLength = 0; // reset per attempt so a stalled partial read isn't kept
+            for await (const chunk of got.body) {
+              chunk.copy(view, byteLength); // one assembly copy (as in bufferPool)
+              byteLength += chunk.length;
+              bump();
+            }
+            return got.hasChecksum;
+          });
+          const downloadMs = performance.now() - t0;
+          dPartsDone += 1;
+          if (hasChecksum) dChecksummed += 1;
+          dispatchInFlight -= 1;
+          bumpProgress(progress, byteLength);
+          parentPort.postMessage(
+            {
+              type: 'part',
+              key: msg.part.key,
+              partNumber: msg.part.partNumber,
+              buffer: ab,
+              byteLength,
+              hasChecksum,
+              downloadMs: partTimes ? downloadMs : undefined,
+              vip: partTimes ? vip : undefined,
+              connId: partTimes ? connId : undefined,
+            },
+            [ab], // transfer list: hand ownership of the bytes to main, no copy
+          );
+          dispatchMaybeDone();
+          return;
+        }
+
+        // discard sink: hold bytes here; main only accounts + 'release's them.
+        let held = null; // chunk[] (default) or a pooled Buffer (bufferPool)
         // bufferPool: acquire one contiguous buffer up front (reused across retries).
         const poolBuf = bufferPool ? acquireBuf(msg.part.size) : null;
         const hasChecksum = await withStallRetry(label, async (signal, bump) => {
@@ -412,6 +480,7 @@ if (deliveryMode === 'ordered-stream') {
         dPartsDone += 1;
         if (hasChecksum) dChecksummed += 1;
         dispatchInFlight -= 1;
+        bumpProgress(progress, byteLength);
         // Tiny metadata only — no bytes cross to main.
         parentPort.postMessage({
           type: 'part-ready',
@@ -427,6 +496,9 @@ if (deliveryMode === 'ordered-stream') {
       } catch (err) {
         parentPort.postMessage({ type: 'error', message: err?.message ?? String(err) });
       }
+    } else if (msg?.type === 'return') {
+      // Stream sink: main handed back a consumed part's ArrayBuffer for reuse.
+      if (bufferReturn && msg.buffer) returnedBufs.push(msg.buffer);
     } else if (msg?.type === 'release') {
       // Delivered in order — free the held bytes (or recycle the pooled buffer).
       const rkey = `${msg.key}#${msg.partNumber}`;

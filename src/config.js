@@ -91,6 +91,15 @@ export function parseSize(v) {
 }
 
 /**
+ * Both ordered delivery modes ('ordered-drop' and 'ordered-stream') use the same
+ * frontier-first dispatch + reorder-buffer machinery; they differ only in what the
+ * delivery frontier feeds (drop vs. a per-object Readable). This groups them.
+ */
+export function isOrderedMode(mode) {
+  return mode === 'ordered-stream' || mode === 'ordered-drop';
+}
+
+/**
  * Canonical object key for a given size label. Single source of truth shared by
  * the seed script and the benchmark so `--sizes` maps to the same keys on both
  * sides (e.g. "30GiB" + prefix "bench/" -> "bench/30gib.bin").
@@ -229,9 +238,12 @@ Options (override bench.config.json):
   --iterations <n>         Measured iterations per key. Default: 3.
   --warmup <n>             Warmup iterations (not counted). Default: 1.
   --keep                   Keep downloaded bytes in memory (default: discard/drain).
-  --delivery <mode>        How bytes are handled: discard | ordered-stream | file.
+  --delivery <mode>        How bytes are handled: discard | ordered-drop |
+                           ordered-stream | file.
                            discard        = drain + throw away on arrival (default)
-                           ordered-stream = reorder buffer, freed in part order
+                           ordered-drop   = reorder, drop at frontier (no consumer)
+                           ordered-stream = reorder, transfer to a per-object
+                                            Readable a consumer drains
                            file           = write each part to its offset in a file
   --delivery-path <dir>    Directory for 'file' mode output (default: OS temp dir).
   --file-async             (file mode) write each part asynchronously (threadpool)
@@ -247,10 +259,16 @@ Options (override bench.config.json):
                            pure-JS @aws-crypto/crc32 loop (verified byte-identical).
   --max-buffered <size>    ordered-stream reorder-buffer cap (default 2GiB). Pauses
                            new part downloads when exceeded; resumes below half.
-  --buffer-pool            (ordered-stream) copy each part into a reused contiguous
+  --buffer-pool            (ordered-drop) copy each part into a reused contiguous
                            buffer instead of retaining raw chunk arrays. Trades a
                            memcpy for lower GC pressure + flat RSS. A/B against the
                            default zero-copy path.
+  --consumer-rate <size>   (ordered-stream) throttle the consumer to size bytes/sec
+                           per object to model a slow reader (0 = unlimited).
+  --no-buffer-return       (ordered-stream) don't transfer consumed buffers back to
+                           workers for reuse (allocate per part instead).
+  --stream-hwm <size>      (ordered-stream) per-object stream highWaterMark for the
+                           Readable + its consumer sink. Default 2x part size.
   --log-connections        Report how connections spread across S3 front-end IPs.
   --ip-throughput          Record per-IP throughput for every size in this run.
   --ip-throughput-sizes <s1,..>  Record per-IP throughput only for these sizes.
@@ -298,7 +316,7 @@ export function parseArgs(argv = process.argv.slice(2)) {
     if (!a.startsWith('--')) continue;
     const key = a.slice(2);
     // Boolean flags.
-    if (['keep', 'json', 'help', 'no-checksum', 'log-connections', 'spread-connections', 'no-tls', 'ip-throughput', 'timeseries', 'part-times', 'buffer-pool', 'file-async', 'profile', 'native-crc32'].includes(key)) {
+    if (['keep', 'json', 'help', 'no-checksum', 'log-connections', 'spread-connections', 'no-tls', 'ip-throughput', 'timeseries', 'part-times', 'buffer-pool', 'file-async', 'profile', 'native-crc32', 'no-buffer-return', 'no-progress'].includes(key)) {
       args[key] = true;
       continue;
     }
@@ -342,9 +360,19 @@ export function parseArgs(argv = process.argv.slice(2)) {
   //   ordered-stream - buffer parts, deliver (free) strictly in part order via a
   //                    reorder buffer (models a sequential consumer)
   //   file           - write each part to its byte offset in a local file
+  // How downloaded bytes are handled end-to-end:
+  //   discard        - drain + throw away on arrival (no ordering; pure ceiling)
+  //   ordered-drop   - reorder buffer, delivered strictly in part order but DROPPED
+  //                    at the frontier (bytes freed in the worker; no consumer).
+  //                    Measures the reorder/backpressure machinery in isolation.
+  //   ordered-stream - reorder, then TRANSFER each part (zero-copy) into a
+  //                    per-object Readable a consumer drains. Models a real user
+  //                    reading a stream per object (cross-thread hand-off +
+  //                    consumer-driven backpressure).
+  //   file           - write each part to its byte offset in a local file
   const deliveryMode = args.delivery ?? pick('deliveryMode') ?? 'discard';
-  if (!['discard', 'ordered-stream', 'file'].includes(deliveryMode)) {
-    throw new Error(`Invalid deliveryMode "${deliveryMode}". Use discard | ordered-stream | file.`);
+  if (!['discard', 'ordered-drop', 'ordered-stream', 'file'].includes(deliveryMode)) {
+    throw new Error(`Invalid deliveryMode "${deliveryMode}". Use discard | ordered-drop | ordered-stream | file.`);
   }
 
   return {
@@ -386,6 +414,18 @@ export function parseArgs(argv = process.argv.slice(2)) {
     // ordered-stream memory strategy: copy chunks into reused contiguous part
     // buffers instead of retaining raw chunk arrays (A/B GC/RSS vs copy cost).
     bufferPool: Boolean(args['buffer-pool'] || pick('bufferPool')),
+    // ordered-stream: throttle the consumer to this many bytes/sec per object (0 =
+    // unlimited) to model a slow reader and exercise backpressure end-to-end.
+    consumerRate: parseSize(args['consumer-rate'] ?? pick('consumerRate') ?? '0'),
+    // ordered-stream: recycle delivered buffers by transferring them back to the
+    // owning worker (bounded memory, zero-copy both ways). --no-buffer-return off.
+    bufferReturn: args['no-buffer-return'] ? false : (pick('bufferReturn') ?? true),
+    // ordered-stream: per-object stream highWaterMark (both the Readable and its
+    // consumer sink). 0 = auto (2 x part size). Bigger lets more in-order parts
+    // flush before backpressure pauses the object.
+    streamHwm: (args['stream-hwm'] ?? pick('streamHwm')) != null
+      ? parseSize(args['stream-hwm'] ?? pick('streamHwm'))
+      : 0,
     // file mode: write each part asynchronously (libuv threadpool) so disk-write
     // latency doesn't block the worker's event loop / socket draining.
     fileAsync: Boolean(args['file-async'] || pick('fileAsync')),
@@ -396,6 +436,8 @@ export function parseArgs(argv = process.argv.slice(2)) {
     profileDir: args['profile-dir'] ?? pick('profileDir') ?? `results/profile-${process.version}`,
     // SDK-layer patch: use native zlib.crc32 instead of @aws-crypto/crc32's JS loop.
     nativeCrc32: Boolean(args['native-crc32'] || pick('nativeCrc32')),
+    // Live progress indicator (bytes/%/Gbps/ETA to stderr). Off in JSON mode.
+    progress: args['no-progress'] ? false : (pick('progress') ?? true),
     ...ipThroughputOpts(args, pick),
     json: Boolean(args.json),
     out: args.out ?? null,
@@ -421,13 +463,34 @@ Options (override bench.config.json):
   --region <region>        AWS region.
   --part-size <size>       Multipart part size (default 64MiB).
   --checksum <algo>        Per-part checksum (CRC32C/CRC32/SHA256/SHA1).
-  --source <mode>          Upload data source: memory | file. Default: memory.
+  --source <mode>          Upload data source: memory | file | stream. Default: memory.
                            memory = upload from a pre-built in-memory buffer
                                     (buffer creation is excluded from timing)
                            file   = read each part from a local file (measures
                                     disk read + upload); a temp file is created
                                     up front, untimed, and removed afterward.
-  --source-path <dir>      Directory for the 'file' source temp file (default: OS temp).
+                           stream = customer hands one Readable per object to main;
+                                    main carves+fills parts and transfers them (zero
+                                    copy) to a pool of uploader threads that
+                                    UploadPart in parallel, out of order.
+                           open   = customer passes a re-openable source descriptor
+                                    (factory); each worker opens its OWN stream for
+                                    its part range (distributes ingress across cores).
+                           open-stream = carver threads open whole-object streams and
+                                    carve parts; a separate uploader pool uploads them.
+  --open-module <path>     ('open'/'open-stream' source) opener module. 'open':
+                           open(params,{start,size}); 'open-stream': open(params,
+                           {key,size}) -> one whole-object Readable.
+  --carvers <n>            (open-stream) number of carver threads (0 = one per object).
+  --open-type <type>       ('open'/'open-stream' built-in opener) file | memory.
+                           memory = generate bytes in-memory (no disk), fastest ingress.
+  --source-path <dir>      Directory for the 'file'/'open' source temp file.
+  --max-buffered <size>    (stream) cap on carved-but-unsent parts held on main
+                           (dispatch queue). 0 = auto ((workers*concurrency+1) parts).
+  --client-rate <size>     (stream) throttle the simulated customer stream to size
+                           bytes/sec per object. 0 = as fast as possible.
+  --client-chunk <size>    (stream) chunk size the simulated customer stream pushes.
+                           Smaller = more realistic, more ingress overhead. Default 1MiB.
   --cipher <name>          Pin the TLS cipher: aes128 | aes256 | chacha20 | default
                            | <raw OpenSSL string>. Pins across TLS 1.3 and 1.2.
   --workers <n>            Worker threads. Default: CPU count.
@@ -440,9 +503,10 @@ Options (override bench.config.json):
   --out <file>             Also write JSON results to <file>.
   --help                   Show this help.
 
-Note: each iteration does CreateMultipartUpload (untimed) -> parallel UploadPart
-(timed) -> CompleteMultipartUpload (untimed). The completed object is left in the
-bucket, so it doubles as seed data for the download benchmark.
+Note: worker spawn + data generation happen first, UNTIMED. The measured window
+then spans the whole multipart lifecycle: CreateMultipartUpload -> parallel
+UploadPart -> CompleteMultipartUpload, so throughput is end-to-end. The completed
+object is left in the bucket, so it doubles as seed data for the download benchmark.
 `;
 
 /**
@@ -456,7 +520,7 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     const a = argv[i];
     if (!a.startsWith('--')) continue;
     const key = a.slice(2);
-    if (['force', 'json', 'help', 'spread-connections', 'no-tls', 'ip-throughput', 'native-crc32'].includes(key)) {
+    if (['force', 'json', 'help', 'spread-connections', 'no-tls', 'ip-throughput', 'native-crc32', 'no-progress'].includes(key)) {
       args[key] = true;
       continue;
     }
@@ -484,9 +548,25 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
   const prefix = args.prefix ?? pick('dataPrefix') ?? '';
   const groups = sizeGroups(prefix, rawSizes);
 
+  // memory - reuse one pre-filled buffer per worker (pure network ceiling)
+  // file   - read each part from a shared source file on demand (blocking readSync)
+  // stream - the customer hands ONE Readable per object to the main thread; main
+  //          reads it, carves + fills part buffers (single-thread ingress), and
+  //          TRANSFERS each part (zero-copy) to a pool of uploader worker threads
+  //          that UploadPart in parallel, out of order. Models a Transfer-Manager
+  //          style API where the customer only ever touches the main thread.
+  // open   - the customer passes a re-openable source DESCRIPTOR (factory pattern),
+  //          not a live stream; each worker OPENS ITS OWN stream for its part's byte
+  //          range and uploads it. Distributes ingress across worker threads (no
+  //          single-thread main funnel). Needs a range-addressable source.
+  // open-stream - two tiers: CARVER worker threads each open a whole-object stream
+  //          (via the opener callback, one object per stream) and carve parts; a
+  //          separate UPLOADER worker pool does the UploadParts. Parts flow
+  //          carver -> main -> uploader by zero-copy transfer, with credit-based
+  //          backpressure. The opener returns one Readable per object (no ranges).
   const uploadSource = args.source ?? pick('uploadSource') ?? 'memory';
-  if (!['memory', 'file'].includes(uploadSource)) {
-    throw new Error(`Invalid uploadSource "${uploadSource}". Use memory | file.`);
+  if (!['memory', 'file', 'stream', 'open', 'open-stream'].includes(uploadSource)) {
+    throw new Error(`Invalid uploadSource "${uploadSource}". Use memory | file | stream | open | open-stream.`);
   }
 
   return {
@@ -497,6 +577,33 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     partSize: parseSize(args['part-size'] ?? pick('partSize') ?? '64MiB'),
     checksum: (args.checksum ?? pick('checksum') ?? 'CRC32C').toUpperCase(),
     uploadSource,
+    // 'open' source: how each worker opens its own stream. Built-in { type: 'file' }
+    // (reads byte ranges of the shared source file) or { module, params } to import a
+    // custom opener module. For 'open' the opener is open(params, { start, size });
+    // for 'open-stream' it's open(params, { key, size }) returning one whole-object
+    // Readable (no ranges — the carver reads it sequentially).
+    uploadOpen: pick('uploadOpen') ?? (args['open-module'] ? { module: args['open-module'] } : { type: args['open-type'] ?? 'file' }),
+    // open-stream: number of carver threads (each opens whole-object streams and
+    // carves parts for the uploader pool). 0 = auto (one per object, capped at that).
+    uploadCarvers: Number(args.carvers ?? pick('uploadCarvers') ?? 0),
+    // stream source: cap (bytes) on carved-but-not-yet-uploaded parts held on main
+    // (the dispatch queue). Bounds memory + gives the uploader pool a surplus to
+    // pull from; when full, main pauses reading the customer stream (backpressure).
+    // 0 = auto ((workers x concurrency + 1) parts).
+    uploadMaxBuffered: (args['max-buffered'] ?? pick('uploadMaxBuffered')) != null
+      ? parseSize(args['max-buffered'] ?? pick('uploadMaxBuffered'))
+      : 0,
+    // stream source: throttle the simulated customer stream to this many bytes/sec
+    // per object (models client send rate). 0 = as fast as possible.
+    uploadClientRate: (args['client-rate'] ?? pick('uploadClientRate')) != null
+      ? parseSize(args['client-rate'] ?? pick('uploadClientRate'))
+      : 0,
+    // stream source: chunk size the simulated customer stream pushes (models how a
+    // client sends). Smaller = more realistic but more per-part event-loop churn on
+    // the single-threaded ingress; larger = less overhead. Default 1MiB.
+    uploadClientChunk: (args['client-chunk'] ?? pick('uploadClientChunk')) != null
+      ? parseSize(args['client-chunk'] ?? pick('uploadClientChunk'))
+      : 1 << 20,
     sourcePath: expandHome(args['source-path'] ?? pick('sourcePath') ?? os.tmpdir()),
     spreadConnections: Boolean(args['spread-connections'] || pick('spreadConnections')),
     tls: args['no-tls'] ? false : (pick('tls') ?? true),
@@ -511,6 +618,8 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     cipher: args.cipher ?? pick('cipher') ?? 'default',
     ciphers: resolveCiphers(args.cipher ?? pick('cipher')),
     nativeCrc32: Boolean(args['native-crc32'] || pick('nativeCrc32')),
+    // Live progress indicator (bytes/%/Gbps/ETA to stderr). Off in JSON mode.
+    progress: args['no-progress'] ? false : (pick('progress') ?? true),
     ...ipThroughputOpts(args, pick),
     json: Boolean(args.json),
     out: args.out ?? null,

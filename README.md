@@ -97,7 +97,7 @@ A representative config (this repo's current one):
     "warmup": 1,
     "keep": false,
     "validateChecksum": true,
-    "deliveryMode": "ordered-stream",
+    "deliveryMode": "ordered-drop",
     "maxBufferedBytes": "64GiB",
     "bufferPool": true,
     "timeseries": false,
@@ -147,10 +147,13 @@ A representative config (this repo's current one):
 | `warmup` | `1` | Unmeasured runs before timing. Primes JIT/describe; note workers/connections are recreated each iteration, so it does not pre-warm the measured sockets. |
 | `keep` | `false` | If `true`, retain downloaded bytes in memory instead of discarding. Leave `false` to measure the pure network/CPU ceiling without buffering cost. |
 | `validateChecksum` | `true` | Whether the SDK validates each part's stored checksum as it streams. Set `false` to isolate raw transfer throughput from the checksum CPU cost. |
-| `deliveryMode` | `ordered-stream` | What happens to bytes: `discard` (drain + drop — pure ceiling), `ordered-stream` (reorder buffer, delivered in part order — models a sequential consumer), or `file` (positional write to disk). See [Delivery modes](#delivery-modes-what-happens-to-downloaded-bytes). |
-| `maxBufferedBytes` | `64GiB` | **ordered-stream only.** Cap on the completed-but-undelivered reorder backlog; dispatch throttles above it (with one-part liveness so it can't hang). Bigger = keeps full concurrency at higher memory; smaller = tighter RSS but can throttle behind a slow low part. |
-| `bufferPool` | `true` | **ordered-stream only.** Copy each part into a reused contiguous buffer instead of retaining raw chunk arrays. Trades a memcpy for far less GC pressure and flat RSS. See [Buffer pool](#buffer-pool-ordered-stream-memory-strategy-bufferpool). |
-| `timeseries` | `false` | **ordered-stream only.** Sample RSS / buffered parts / in-flight / CPU every 500 ms → CSV + SVG plot. Off for normal runs. |
+| `deliveryMode` | `ordered-drop` | What happens to bytes: `discard` (drain + drop on arrival — pure ceiling, no ordering), `ordered-drop` (reorder buffer, delivered in part order then dropped at the frontier — models the ordering machinery with no consumer), `ordered-stream` (reorder, then transfer each part zero-copy into a per-object `Readable` a consumer drains — models a real user reading a stream per object), or `file` (positional write to disk). See [Delivery modes](#delivery-modes-what-happens-to-downloaded-bytes). |
+| `maxBufferedBytes` | `64GiB` | **ordered modes only.** Cap on the completed-but-undelivered reorder backlog; dispatch throttles above it (with one-part liveness so it can't hang). Bigger = keeps full concurrency at higher memory; smaller = tighter RSS but can throttle behind a slow low part. |
+| `bufferPool` | `true` | **ordered-drop only.** Copy each part into a reused contiguous buffer instead of retaining raw chunk arrays. Trades a memcpy for far less GC pressure and flat RSS. (`ordered-stream` transfers dedicated buffers instead, so this is a no-op there.) See [Buffer pool](#buffer-pool-ordered-drop-memory-strategy-bufferpool). |
+| `consumerRate` | `0` | **ordered-stream only.** Throttle the consumer to this many bytes/sec per object (e.g. `500MiB`), to model a slow reader and exercise backpressure end-to-end. `0` = unlimited. |
+| `bufferReturn` | `true` | **ordered-stream only.** After the consumer reads a part, transfer its buffer back to the owning worker for reuse, so a bounded set of buffers ping-pongs across the thread boundary (zero-copy both ways) instead of allocating one per part. |
+| `streamHwm` | `2 × partSize` | **ordered-stream only.** Per-object stream highWaterMark, applied to both the object `Readable` and its consumer sink. It's a soft backpressure threshold (not a hard cap): bigger lets more in-order parts flush before the object pauses, at the cost of more resident memory per active object. Omit (or `0`) for the `2 × partSize` auto-default. |
+| `timeseries` | `false` | **ordered modes only.** Sample RSS / buffered parts / in-flight / CPU every 500 ms → CSV + SVG plot. Off for normal runs. |
 | `partTimes` | `true` | Record every part's download time (+ serving `vip`/`conn_id`) to CSV and print p50/p90/p99/p99.9 latency. Also enables the socket-capture middleware. All delivery modes. |
 | `stallTimeoutMs` | `10000` | Abort + re-fetch a part that reads **no bytes** for this long (a stuck connection blocking in-order delivery). `0` disables the watchdog. |
 | `partRetries` | `8` | Max stall-retries per part before the run fails. Raise if your network produces frequent stalls (e.g. the plaintext-HTTP path). |
@@ -171,7 +174,12 @@ A representative config (this repo's current one):
 | `iterations` | `1` | Measured upload runs per size. |
 | `warmup` | `1` | Unmeasured priming run. |
 | `forceUpload` | `false` | If `true`, upload even when a matching object already exists; otherwise skip objects whose size **and** part size already match. |
-| `uploadSource` | `memory` | Where part bytes come from: `memory` (pre-built buffer, generation excluded from timing) or `file` (read each part from disk — measures disk + upload). |
+| `uploadSource` | `memory` | Where part bytes come from: `memory` (pre-built buffer, generation excluded from timing), `file` (read each part from disk inline — measures disk + upload),, `stream` (the customer hands one `Readable` per object to main; main carves + transfers parts to a pool of uploader threads), or `open` (the customer passes a re-openable source descriptor; each worker opens its own stream for its part range — distributes ingress across cores). See the Data source section below. |
+| `uploadOpen` | `{ "type": "file" }` | **open / open-stream only.** The source descriptor: `{ "type": "file" }` (read the shared source file), `{ "type": "memory" }` (generate bytes in-memory on each worker — no disk, fastest ingress), or `{ "module": "./opener.js", "params": {…} }` to import a custom opener. For `open` the export is `open(params, { start, size }) -> Readable`; for `open-stream` it's `open(params, { key, size }) -> Readable` (one whole-object stream). The module path is resolved to an absolute URL on main. |
+| `uploadCarvers` | `0` (auto) | **open-stream only.** Number of carver threads. `0` = one per object; set lower to put multiple objects on each carver (they're carved sequentially). Carvers + uploaders (`workers`) are separate pools, so total threads ≈ `carvers + workers`. |
+| `uploadMaxBuffered` | `0` (auto) | **stream source only.** Cap (bytes) on carved-but-not-yet-uploaded parts held on main (the dispatch queue). Bounds memory and gives the uploader pool a surplus to pull from; when full, main pauses reading the customer stream (backpressure). `0` = auto (`workers × concurrency + 1` parts). |
+| `uploadClientRate` | `0` | **stream source only.** Throttle the simulated customer stream to this many bytes/sec per object (models client send rate). `0` = as fast as possible. |
+| `uploadClientChunk` | `1MiB` | **stream source only.** Chunk size the simulated customer stream pushes. Smaller = more realistic client behavior but more per-part event-loop churn on the single-threaded main ingress; larger reduces that overhead. Useful for measuring how much of the ingress ceiling is stream machinery vs. the raw per-byte memcpy. |
 | `spreadConnections` | `false` | Same DNS-spreading as download, per-direction. |
 | `ipThroughputSizes` | `[]` | Per-IP throughput recording for upload, gated by size label. |
 
@@ -289,20 +297,58 @@ multipart upload, uploads all parts in parallel across workers (each doing up to
 `concurrency` `UploadPart` calls), then completes it. It reads the `upload` section
 plus shared keys (`sizes`, `partSize`, `checksum`, …) from `bench.config.json`.
 
-Each iteration = `CreateMultipartUpload` (untimed) → parallel `UploadPart` (timed)
-→ `CompleteMultipartUpload` (untimed). Only the part transfer is timed, mirroring
-how the download benchmark excludes the HEAD lookup.
+Worker spawn + data generation happen first, **untimed** (the clock starts only
+once every worker is ready). The measured window then spans the whole multipart
+lifecycle: `CreateMultipartUpload` → parallel `UploadPart` → `CompleteMultipartUpload`,
+so the reported throughput is **end-to-end** for the upload (create + all parts +
+complete), not just the part transfer.
 
 **Data source** — set `uploadSource` in the `upload` section:
 
 ```json
-"upload": { "uploadSource": "memory" }   // or "file"
+"upload": { "uploadSource": "memory" }   // or "file" | "stream"
 ```
 
 | `uploadSource` | What it does | Measures |
 |--------|--------------|----------|
 | `memory` (default) | Upload from a pre-built in-memory random buffer, generated **before** timing starts | Pure network + CPU (checksum) upload cost |
-| `file` | Read each part from a local file during upload; the source file is created up front, **untimed**, and removed afterward | Disk read + upload |
+| `file` | Read each part from a local file during upload, inline with the send loop (a blocking `readSync`, so the worker's event loop stalls during each read) | Disk read + upload, serialized |
+| `stream` | The customer hands one `Readable` per object to **main**; main reads it, carves + fills part buffers, and **transfers** each part (zero-copy) to a pool of **uploader worker threads** that `UploadPart` in parallel, out of order | Transfer-Manager-style streaming upload: single-thread ingress + fanned-out parallel upload |
+| `open` | The customer passes a re-openable source **descriptor** (factory pattern), not a live stream; **each worker opens its own stream** for its part's byte range and uploads it | Distributed ingress — reading is fanned across worker threads (no single-thread main funnel), for range-addressable sources |
+| `open-stream` | Two tiers: **carver** threads each open a *whole-object* stream (via the opener callback, one object per stream) and carve parts; a separate **uploader** pool does the `UploadPart`s. Parts flow carver → main → uploader by zero-copy transfer, with credit-based backpressure | Carving (ingress) and uploading run on separate thread pools; ingress parallelizes across objects without needing a range-addressable source |
+
+**Stream source (`stream`) — a Transfer-Manager-style API where the customer only touches the main thread.** The customer hands one `Readable` per object to main; internally we fan the upload across worker threads without the customer ever seeing them:
+
+- **Main carves.** A producer per object reads the (here, synthetic) customer stream, copies each part's bytes into a recycled buffer (the ingress fill — bytes flow through main as a client would send them), numbers it, and enqueues it. A `Readable` can't cross the worker boundary, so this ingress is necessarily single-threaded on main.
+- **Fan-out to an uploader pool.** Main transfers each carved part (zero-copy `postMessage`) to an idle lane across the uploader worker pool; any worker uploads any object's parts, out of order (S3 assembles by `PartNumber`). Workers transfer the freed buffer back for reuse (return-credit).
+- **Backpressure.** A bounded pool of recycled buffers (cap = `uploadMaxBuffered`) gates everything: when main can't get a free buffer it stops reading the customer stream, which throttles the client. Bounded memory end-to-end.
+- **`CompleteMultipartUpload`** per object once its stream ends and all its parts are acked.
+- Optional `uploadClientRate` throttles the simulated client's send rate.
+
+Honest ceiling: the ingress (read + fill) is single-threaded on main (~one core's memcpy), so a *single* stream is capped there regardless of how many uploader workers there are — you can hide the fan-out behind main, but not beat single-thread ingress for one stream. Parallelism comes from multiple concurrent object streams. Each part is still sent as a materialized `Buffer` (header checksum, same wire format as `memory`/`file`).
+
+**Open source (`open`) — the factory pattern that distributes ingress.** The `stream` ceiling exists because a live `Readable` can't cross the worker boundary, so main is the sole ingress thread. The `open` source removes that limit: instead of a live stream, the customer passes a **re-openable descriptor** (data, not a closure), and **each worker opens its own stream** for its assigned part ranges — so reading is fanned across worker threads, no main funnel.
+
+```json
+"upload": { "uploadSource": "open", "uploadOpen": { "type": "file" } }
+```
+
+- **Built-in file opener** (`{ "type": "file" }`, the default): a shared source file is written up front (untimed), and each worker opens `fs.createReadStream(path, { start, end })` for each of its parts' byte ranges, drains it, and uploads. Because a file is range-addressable, one object's ingress spans all workers.
+- **Custom module opener** (`{ "module": "./my-opener.js", "params": { ... } }`, or `--open-module`): each worker `import()`s the module and calls its exported `open(params, { start, size }) -> Readable`. This is the "customer's open callback, executed on the worker" — delivered as an importable module (a function/closure can't be structured-cloned). Use it for any range-addressable source (HTTP Range, S3, a generator).
+
+The requirement is that the source be **re-openable from a reference on the worker's thread** (a path, URL, key + byte range). That's what lets ingress parallelize — unlike a live push stream, which is stuck on main (`stream` mode). Use `open` to lift the single-thread ingress ceiling when the source is seekable; use `stream` when the customer genuinely hands you one live stream.
+
+**Open-stream source (`open-stream`) — two tiers: carvers + uploaders.** Where `open` opens a *ranged* read per part (needs a seekable source), `open-stream` handles a source that's only *sequential per object*: **carver** threads each open one whole-object `Readable` (via the opener, `open(params, { key, size })`), read it front-to-back, and carve part buffers; a separate **uploader** pool does the `UploadPart`s.
+
+```json
+"upload": { "uploadSource": "open-stream", "uploadCarvers": 4, "uploadOpen": { "type": "file" } }
+```
+
+- Parts flow **carver → main → uploader** by zero-copy transfer; main brokers and, when a part finishes uploading, transfers the freed buffer **back to its carver** with an `ack`. That ack is also a **credit**: a carver never has more than `uploadMaxBuffered / carvers` parts outstanding, so it pauses reading its stream when the uploader pool falls behind (end-to-end backpressure, bounded memory).
+- **Carving and uploading are separate thread pools**, so per-object sequential ingress (carving) doesn't block the parallel `UploadPart`s. Ingress parallelizes **across objects** (one carver per object by default).
+- `uploadCarvers` consolidates objects onto fewer carver threads (each carves its objects sequentially), so you don't spawn a thread per object when you have many. Total threads ≈ `carvers + workers`.
+
+This is the model for "the customer hands us a stream we can re-open per object but not range-address" — e.g. a per-object generator or a non-seekable-but-reopenable source. A genuinely live single push stream still belongs in `stream` mode (main-carve).
 
 - **memory**: the random buffer is allocated + filled once per worker before the
   worker signals ready, so buffer-creation time is excluded from the measured
@@ -418,37 +464,40 @@ round-trip above keeps auth on your dev box only.)
 
 ## Delivery modes (what happens to downloaded bytes)
 
-The download benchmark can handle the bytes three ways, set via `deliveryMode` in
+The download benchmark can handle the bytes four ways, set via `deliveryMode` in
 the `download` section:
 
 | `deliveryMode` | What it does | Models | Cost |
 |------|--------------|--------|------|
 | `discard` (default) | Drain and throw away each part on arrival | Pure network/CPU throughput ceiling | Minimal memory |
-| `ordered-stream` | Buffer parts, deliver (free) strictly in part order via a reorder buffer | A sequential consumer (stdout, socket, decompressor) that needs contiguous bytes | Holds out-of-order parts in memory (head-of-line blocking) |
+| `ordered-drop` | Buffer parts, deliver strictly in part order, then drop (free) at the frontier — no consumer | The reorder/backpressure machinery in isolation (infinitely fast sink) | Holds out-of-order parts in memory (head-of-line blocking) |
+| `ordered-stream` | Buffer parts, then **transfer** each (zero-copy) into a per-object `Readable` a consumer drains | A real user reading a stream per object | Reorder buffer + cross-thread hand-off + consumer-driven backpressure |
 | `file` | Positional-write each part to its byte offset in a local file | Downloading to disk | Disk write; no reorder buffer (out-of-order writes are fine) |
 
 ```json
 "download": {
-  "deliveryMode": "ordered-stream",   // discard | ordered-stream | file
-  "deliveryPath": "/mnt/nvme"         // output dir for "file" mode (default OS temp)
+  "deliveryMode": "ordered-drop",   // discard | ordered-drop | ordered-stream | file
+  "deliveryPath": "/mnt/nvme"       // output dir for "file" mode (default OS temp)
 }
 ```
 
 Notes:
-- **ordered-stream** delivers each object's parts strictly in order, holding
-  out-of-order parts until earlier ones are delivered. Design: the main thread
-  drives dispatch (ascending, frontier-first) and coordinates ordering with **tiny
-  metadata messages only** — the downloaded **bytes stay in the workers** (held as
-  raw chunks) and are freed when main signals a part was delivered in order. This
-  avoids funneling every byte through the single main thread and skips a reassembly
-  copy, so it scales far better than a transfer-based approach. The reorder backlog
-  (held-but-undelivered bytes, across all workers) is bounded by `maxBufferedBytes`
-  (default 2 GiB); in-flight is bounded separately by
+- **ordered-drop** and **ordered-stream** share the same engine: the main thread
+  drives dispatch (ascending, frontier-first) and enforces per-object in-order
+  delivery, holding out-of-order parts until earlier ones arrive. The reorder
+  backlog (held-but-undelivered bytes, across all workers) is bounded by
+  `maxBufferedBytes` (default 2 GiB); in-flight is bounded separately by
   `workers × concurrency`, so full network concurrency is preserved. It cannot hang:
   when nothing is in flight it dispatches the next (lowest-needed) part regardless
-  of the cap. A tight cap bounds the backlog memory but throttles when a slow low
-  part blocks delivery; a generous cap keeps full concurrency at higher memory. Compare its peak RSS/throughput to
-  `discard` to see the memory and head-of-line-blocking cost of in-order delivery.
+  of the cap.
+- **ordered-drop** coordinates ordering with **tiny metadata messages only** — the
+  downloaded **bytes stay in the workers** (held as raw chunks, or reused contiguous
+  buffers with `bufferPool`) and are freed when main signals a part was delivered in
+  order. Nothing is consumed. This isolates the ordering/backpressure cost against an
+  infinitely fast sink. Compare its peak RSS/throughput to `discard` to see the
+  memory and head-of-line-blocking cost of in-order delivery.
+- **ordered-stream** actually delivers the bytes to a consumer — see
+  [Stream delivery](#stream-delivery-ordered-stream) below.
 - **file** writes to `deliveryPath` (default OS temp dir) and removes the file
   after the run. Byte-integrity of the offset-based assembly is verified. Point
   `deliveryPath` at a fast disk (NVMe) so storage doesn't become the bottleneck.
@@ -469,9 +518,9 @@ Notes:
   ```
 - **discard** is the right mode for finding the NIC/CPU ceiling.
 
-### Buffer pool (ordered-stream memory strategy, `bufferPool`)
+### Buffer pool (ordered-drop memory strategy, `bufferPool`)
 
-By default ordered-stream retains each completed part as its **raw chunk array**
+By default ordered-drop retains each completed part as its **raw chunk array**
 (zero-copy) until delivery. That's cheap on CPU but holds hundreds of thousands of
 small `Buffer`s alive under head-of-line blocking — heavy old-gen GC and inflated,
 fragmented RSS. Setting `"bufferPool": true` in the `download` section switches to
@@ -479,7 +528,7 @@ copying each part into a **reused, contiguous part-sized buffer** from a per-wor
 free list:
 
 ```json
-"download": { "deliveryMode": "ordered-stream", "bufferPool": true }
+"download": { "deliveryMode": "ordered-drop", "bufferPool": true }
 ```
 
 The tradeoff (the run header shows `buffer-pool ON/OFF`):
@@ -490,8 +539,42 @@ The tradeoff (the run header shows `buffer-pool ON/OFF`):
 
 It's a net win only when GC/fragmentation is the limiter (large reorder backlog,
 not network-bound). Pair it with `timeseries` and `partTimes` to compare RSS, CPU,
-and the latency tail against the default path. ordered-stream only; ignored
-otherwise.
+and the latency tail against the default path. `ordered-drop` only; `ordered-stream`
+transfers dedicated buffers instead, so it's ignored there.
+
+### Stream delivery (`ordered-stream`)
+
+`ordered-drop` is a *virtual* consumer: once a part reaches the delivery frontier
+the main thread only accounts its bytes and tells the worker to free them — **the
+bytes never leave the worker**. That isolates the reorder/backpressure machinery
+against an infinitely fast sink, but it isn't what a real user sees. A real
+Transfer-Manager consumer wants to *read an ordered stream per object*.
+
+`deliveryMode: "ordered-stream"` models that faithfully:
+
+```json
+"download": { "deliveryMode": "ordered-stream", "consumerRate": "0" }
+```
+
+- The worker assembles each part into a **dedicated** `ArrayBuffer` and **transfers**
+  it to the main thread via the `postMessage` transfer list — ownership of the
+  memory moves, so it's **zero-copy** (O(1) regardless of part size), not a funnel
+  copy. The one assembly copy (socket → contiguous buffer) is the same one
+  `bufferPool` already pays.
+- The main thread pushes transferred parts, in order, into a **per-object
+  `Readable`**, which a consumer drains. Delivery for an object cannot advance past a
+  missing part (per-object head-of-line ordering).
+- **Consumer backpressure is real:** if the `Readable`'s highWaterMark fills (e.g. a
+  slow consumer, set via `consumerRate`), delivery for that object pauses, the
+  reorder backlog rises to `maxBufferedBytes`, and dispatch throttles — end to end.
+- With `bufferReturn` (default), the consumed buffer is transferred **back** to the
+  owning worker for reuse, so a bounded set of buffers ping-pongs across the thread
+  boundary (zero-copy both ways) rather than allocating one per part.
+
+Use `ordered-drop` to find the reorder ceiling; use `ordered-stream` to measure the
+true cost of delivering ordered bytes to a consumer — the cross-thread hand-off plus
+consumer-driven backpressure — which is exactly what a worker-thread Transfer
+Manager pays. Compare the two modes' throughput/RSS/latency to quantify it.
 
 ### Time series (ordered-stream)
 
@@ -852,10 +935,13 @@ node src/upload-test-data.js --help   # seed
 | `--warmup <n>` | `warmup` | Unmeasured warmup iterations |
 | `--keep` | `keep` | Keep bodies in memory instead of draining |
 | `--no-checksum` | `validateChecksum:false` | Disable per-part checksum validation |
-| `--delivery <mode>` | `deliveryMode` | `discard` \| `ordered-stream` \| `file` |
+| `--delivery <mode>` | `deliveryMode` | `discard` \| `ordered-drop` \| `ordered-stream` \| `file` |
 | `--delivery-path <dir>` | `deliveryPath` | Output dir for `file` mode |
 | `--max-buffered <size>` | `maxBufferedBytes` | ordered-stream reorder-buffer cap |
 | `--buffer-pool` | `bufferPool` | ordered-stream: copy into reused contiguous buffers |
+| `--consumer-rate <size>` | `consumerRate` | ordered-stream: throttle consumer bytes/sec (0 = unlimited) |
+| `--no-buffer-return` | `bufferReturn:false` | ordered-stream: don't recycle buffers back to workers |
+| `--stream-hwm <size>` | `streamHwm` | ordered-stream: per-object stream highWaterMark (default 2 × partSize) |
 | `--timeseries` | `timeseries` | ordered-stream: 500 ms RSS/buffer/CPU CSV + SVG |
 | `--timeseries-file <base>` | `timeseriesFile` | Base path for the time-series files |
 | `--part-times` | `partTimes` | Per-part download-time CSV + latency percentiles |
@@ -890,7 +976,13 @@ Shares the tuning flags above (`--workers`, `--concurrency`, `--iterations`,
 | `--sizes <s1,s2>` | `sizes` | Sizes to upload (each optionally `<size>:<count>`) |
 | `--part-size <size>` | `partSize` | Multipart part size |
 | `--checksum <algo>` | `checksum` | `CRC32` \| `CRC32C` \| `SHA256` \| `SHA1` |
-| `--source <mode>` | `uploadSource` | `memory` \| `file` |
+| `--source <mode>` | `uploadSource` | `memory` \| `file` \| `stream` \| `open` \| `open-stream` |
+| `--open-module <path>` | `uploadOpen.module` | `open`/`open-stream` source: opener module |
+| `--open-type <type>` | `uploadOpen.type` | built-in opener: `file` \| `memory` (in-memory, no disk) |
+| `--carvers <n>` | `uploadCarvers` | open-stream: carver thread count (0 = one per object) |
+| `--max-buffered <size>` | `uploadMaxBuffered` | stream source: main-side dispatch queue cap (0 = auto) |
+| `--client-rate <size>` | `uploadClientRate` | stream source: throttle simulated client bytes/sec (0 = unlimited) |
+| `--client-chunk <size>` | `uploadClientChunk` | stream source: simulated client push chunk size (default 1MiB) |
 | `--source-path <dir>` | `sourcePath` | Dir for the `file` source temp file |
 | `--force` | `forceUpload` | Upload even if a matching object exists |
 

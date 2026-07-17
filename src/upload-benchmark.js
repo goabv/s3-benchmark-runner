@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { Worker } from 'node:worker_threads';
-import { fileURLToPath } from 'node:url';
+import { Readable } from 'node:stream';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { writeFileSync, mkdirSync, createWriteStream, rmSync } from 'node:fs';
 import { randomFillSync } from 'node:crypto';
 import { createRequire } from 'node:module';
@@ -14,6 +15,7 @@ import {
 import { makeClient } from './s3.js';
 import { parseUploadArgs, parseSize, computeParts, formatBytes, throughput } from './config.js';
 import { ResourceMonitor } from './resource-monitor.js';
+import { newProgressBuffer, ProgressReporter } from './progress.js';
 import {
   mergeIpThroughput,
   ipIterationGbps,
@@ -79,21 +81,25 @@ function completedPart(r) {
  * Excludes worker spawn + client init + data generation (ready/start handshake),
  * so it measures only the parallel UploadPart data transfer.
  */
-function runOnce({ bucket, region, parts, workers, concurrency, checksum, maxSockets, uploadSource, sourceFilePath, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32 }) {
-  const buckets = assignParts(parts, workers).filter((b) => b.length > 0);
-  const active = buckets.length;
+function runOnce({ bucket, region, baseParts, keys, workers, concurrency, checksum, maxSockets, uploadSource, sourceFilePath, openDesc, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32, progressBuf, reporter, onCreate, onComplete }) {
+  const totalParts = baseParts.length * keys.length;
+  const nWorkers = Math.max(1, Math.min(workers, totalParts));
+  const partSizeMax = baseParts.reduce((m, p) => Math.max(m, p.size), 0);
 
   return new Promise((resolve, reject) => {
     const threads = [];
     let readyCount = 0;
     let doneCount = 0;
-    let startTime = 0;
+    let t0 = 0;
     const results = [];
     let settled = false;
     let tlsInfo = null;
     const runIpTput = new Map();
 
-    const cleanup = () => threads.forEach((w) => w.terminate());
+    const cleanup = () => {
+      reporter?.stop();
+      threads.forEach((w) => w.terminate());
+    };
     const fail = (err) => {
       if (settled) return;
       settled = true;
@@ -101,33 +107,268 @@ function runOnce({ bucket, region, parts, workers, concurrency, checksum, maxSoc
       reject(err instanceof Error ? err : new Error(String(err)));
     };
 
-    for (const slice of buckets) {
+    // All workers ready (spawn + data-gen done, untimed). Now start the clock and
+    // run the full multipart lifecycle: CreateMPU -> parallel UploadPart -> CompleteMPU.
+    const beginTimedRun = async () => {
+      try {
+        t0 = performance.now();
+        reporter?.start();
+        const { parts } = await onCreate();
+        const buckets = assignParts(parts, nWorkers); // nWorkers <= totalParts -> all non-empty
+        for (let wi = 0; wi < nWorkers; wi++) threads[wi].postMessage({ type: 'start', parts: buckets[wi] });
+      } catch (err) {
+        fail(err);
+      }
+    };
+
+    for (let wi = 0; wi < nWorkers; wi++) {
       const worker = new Worker(WORKER_PATH, {
         workerData: {
-          bucket, region, parts: slice, concurrency, checksum, maxSockets,
-          uploadSource, sourceFilePath, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32,
+          bucket, region, concurrency, checksum, maxSockets, maxPartSize: partSizeMax,
+          uploadSource, sourceFilePath, openDesc, spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32,
+          workerId: wi, progressBuf,
         },
       });
       threads.push(worker);
 
       worker.on('message', (msg) => {
         if (msg.type === 'ready') {
-          if (++readyCount === active) {
-            startTime = performance.now();
-            threads.forEach((w) => w.postMessage({ type: 'start' }));
-          }
+          if (++readyCount === nWorkers) beginTimedRun();
         } else if (msg.type === 'done') {
           results.push(msg);
           mergeIpThroughput(runIpTput, msg.ipThroughput);
           if (!tlsInfo && msg.tlsInfo) tlsInfo = msg.tlsInfo;
-          if (++doneCount === active && !settled) {
-            settled = true;
-            const wallMs = performance.now() - startTime;
-            cleanup();
-            const bytes = results.reduce((s, r) => s + r.bytes, 0);
-            const completed = results.flatMap((r) => r.completed);
-            resolve({ bytes, completed, wallMs, ipThroughput: [...runIpTput], tlsInfo });
+          if (++doneCount === nWorkers && !settled) {
+            // All parts uploaded; complete the MPUs (inside the timed window), then resolve.
+            (async () => {
+              try {
+                const completed = results.flatMap((r) => r.completed);
+                await onComplete(completed);
+                const wallMs = performance.now() - t0;
+                settled = true;
+                cleanup();
+                const bytes = results.reduce((s, r) => s + r.bytes, 0);
+                resolve({ bytes, completed, wallMs, ipThroughput: [...runIpTput], tlsInfo });
+              } catch (err) {
+                fail(err);
+              }
+            })();
           }
+        } else if (msg.type === 'error') {
+          fail(new Error(`worker: ${msg.message}`));
+        }
+      });
+      worker.on('error', fail);
+      worker.on('exit', (code) => {
+        if (code !== 0 && !settled) fail(new Error(`worker exited with code ${code}`));
+      });
+    }
+  });
+}
+
+/**
+ * Synthetic customer stream: a real Readable that emits `size` bytes as a client
+ * would push them — in chunks of `template.length`, optionally throttled to
+ * `clientRate` bytes/sec. Reuses the pre-filled template (content is irrelevant to
+ * S3, and the consumer copies each chunk out immediately, so sharing is safe).
+ */
+function makeCustomerStream(size, template, clientRate) {
+  let sent = 0;
+  return new Readable({
+    highWaterMark: template.length,
+    read() {
+      if (sent >= size) {
+        this.push(null);
+        return;
+      }
+      const n = Math.min(template.length, size - sent);
+      const chunk = n === template.length ? template : template.subarray(0, n);
+      const emit = () => {
+        sent += n;
+        this.push(chunk);
+      };
+      if (clientRate > 0) setTimeout(emit, (n / clientRate) * 1000);
+      else emit();
+    },
+  });
+}
+
+/**
+ * STREAM upload: the customer hands one Readable per object to the main thread.
+ * Main reads each stream, carves + fills part buffers (single-thread ingress),
+ * then TRANSFERS each part (zero-copy) to a pool of uploader worker threads that
+ * UploadPart in parallel, out of order. A bounded pool of recycled buffers (cap =
+ * uploadMaxBuffered) is the backpressure: when main can't get a free buffer it
+ * stops reading the customer stream. Completion is by part count.
+ *
+ * Returns the same shape as runOnce: { bytes, completed, wallMs, ipThroughput, tlsInfo }.
+ */
+function runStreamUpload({
+  bucket, region, keys, baseParts, workers, concurrency, checksum, maxSockets,
+  spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32, uploadMaxBuffered, clientRate, clientChunk,
+  progressBuf, reporter, onCreate, onComplete,
+}) {
+  const perFileBytes = baseParts.reduce((s, p) => s + p.size, 0);
+  const partSizeMax = baseParts.reduce((m, p) => Math.max(m, p.size), 0) || 1;
+  const totalParts = baseParts.length * keys.length;
+  const nWorkers = Math.max(1, Math.min(workers, totalParts));
+  const lanesPerWorker = Math.max(1, concurrency);
+  const budget = uploadMaxBuffered > 0 ? uploadMaxBuffered : (nWorkers * lanesPerWorker + 1) * partSizeMax;
+  const maxBuffers = Math.max(nWorkers * lanesPerWorker + 1, Math.floor(budget / partSizeMax) || 1);
+
+  return new Promise((resolve, reject) => {
+    const threads = [];
+    let readyCount = 0;
+    let settled = false;
+    let t0 = 0;
+    let uploadIds = {};
+    let tlsInfo = null;
+
+    // Recycled buffer pool on main: carve -> transfer to worker -> transferred back.
+    const freeBufs = [];
+    for (let i = 0; i < maxBuffers; i++) freeBufs.push(Buffer.allocUnsafeSlow(partSizeMax));
+    const bufWaiters = [];
+    const acquireBuf = async () => {
+      let b = freeBufs.pop();
+      while (!b) {
+        await new Promise((r) => bufWaiters.push(r));
+        b = freeBufs.pop();
+      }
+      return b;
+    };
+    const releaseBuf = (ab) => {
+      freeBufs.push(Buffer.from(ab)); // ArrayBuffer transferred back from a worker
+      bufWaiters.shift()?.();
+    };
+
+    const freeLanes = new Array(nWorkers).fill(lanesPerWorker);
+    const ready = []; // carved parts awaiting a free lane: { key, uploadId, partNumber, size, buf }
+    const completed = [];
+    let uploadedCount = 0;
+    let totalBytes = 0;
+
+    const cleanup = () => {
+      reporter?.stop();
+      threads.forEach((w) => w.terminate());
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    const dispatch = () => {
+      for (let wi = 0; wi < nWorkers && ready.length; wi++) {
+        while (freeLanes[wi] > 0 && ready.length) {
+          const it = ready.shift();
+          freeLanes[wi] -= 1;
+          threads[wi].postMessage(
+            { type: 'upload', key: it.key, uploadId: it.uploadId, partNumber: it.partNumber, size: it.size, buffer: it.buf.buffer },
+            [it.buf.buffer],
+          );
+        }
+      }
+    };
+    const enqueue = (item) => {
+      ready.push(item);
+      dispatch();
+    };
+
+    // Pre-filled template (untimed) sized to the client chunk: the customer stream
+    // emits it repeatedly. Larger chunk = fewer stream cycles on the ingress thread.
+    const template = Buffer.allocUnsafe(Math.max(1, clientChunk || 1 << 20));
+    randomFillSync(template);
+
+    // One producer per object: read its customer stream, carve + fill part buffers.
+    async function produceKey(key) {
+      const uploadId = uploadIds[key];
+      const stream = makeCustomerStream(perFileBytes, template, clientRate);
+      let partIdx = 0;
+      let buf = null;
+      let off = 0;
+      for await (const chunk of stream) {
+        let cpos = 0;
+        while (cpos < chunk.length) {
+          if (!buf) {
+            buf = await acquireBuf();
+            off = 0;
+          }
+          const target = baseParts[partIdx].size;
+          const n = Math.min(chunk.length - cpos, target - off);
+          chunk.copy(buf, off, cpos, cpos + n); // INGRESS fill: customer bytes -> part buffer
+          off += n;
+          cpos += n;
+          if (off === target) {
+            enqueue({ key, uploadId, partNumber: baseParts[partIdx].partNumber, size: target, buf });
+            buf = null;
+            partIdx += 1;
+          }
+        }
+      }
+    }
+
+    const onUploaded = (wi, msg) => {
+      freeLanes[wi] += 1;
+      if (!tlsInfo && msg.tlsInfo) tlsInfo = msg.tlsInfo;
+      completed.push({
+        key: msg.key,
+        PartNumber: msg.partNumber,
+        ETag: msg.ETag,
+        ChecksumCRC32C: msg.ChecksumCRC32C,
+        ChecksumCRC32: msg.ChecksumCRC32,
+        ChecksumSHA1: msg.ChecksumSHA1,
+        ChecksumSHA256: msg.ChecksumSHA256,
+      });
+      totalBytes += msg.size;
+      uploadedCount += 1;
+      releaseBuf(msg.buffer);
+      if (uploadedCount === totalParts) {
+        if (!settled) {
+          // All parts uploaded; complete the MPUs (inside the timed window), then resolve.
+          (async () => {
+            try {
+              await onComplete(completed);
+              const wallMs = performance.now() - t0;
+              settled = true;
+              threads.forEach((w) => w.postMessage({ type: 'stop' }));
+              cleanup();
+              resolve({ bytes: totalBytes, completed, wallMs, ipThroughput: [], tlsInfo });
+            } catch (err) {
+              fail(err);
+            }
+          })();
+        }
+        return;
+      }
+      dispatch();
+    };
+
+    for (let wi = 0; wi < nWorkers; wi++) {
+      const worker = new Worker(WORKER_PATH, {
+        workerData: {
+          bucket, region, uploadSource: 'stream', concurrency, checksum, maxSockets,
+          spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32, workerId: wi, progressBuf,
+        },
+      });
+      threads.push(worker);
+      worker.on('message', (msg) => {
+        if (msg.type === 'ready') {
+          if (++readyCount === nWorkers) {
+            // All uploaders ready. Start the clock, create the MPUs, then stream.
+            (async () => {
+              try {
+                t0 = performance.now();
+                reporter?.start();
+                ({ uploadIds } = await onCreate());
+                Promise.all(keys.map((k) => produceKey(k))).catch(fail); // completion driven by uploadedCount
+              } catch (err) {
+                fail(err);
+              }
+            })();
+          }
+        } else if (msg.type === 'uploaded') {
+          onUploaded(wi, msg);
         } else if (msg.type === 'error') {
           fail(new Error(`worker: ${msg.message}`));
         }
@@ -165,80 +406,281 @@ function writeRandomFile(filePath, size, chunkSize = 8 * 1024 * 1024) {
 }
 
 /**
- * One iteration for a whole group: create a multipart upload per key (untimed),
- * upload all parts pooled across keys (timed), then complete each upload (untimed).
+ * OPEN-STREAM upload (two tiers). CARVER workers each open a whole-object stream
+ * (via the opener, one object per stream, on their own thread) and carve part
+ * buffers; a separate UPLOADER pool does the UploadParts. Parts flow
+ * carver -> main -> uploader by zero-copy transfer; each uploaded buffer is
+ * transferred back to its carver (recycled) with an 'ack' that also frees a credit,
+ * so a carver never has more than `carverLimit` parts outstanding (backpressure).
+ *
+ * Returns the runOnce shape: { bytes, completed, wallMs, ipThroughput, tlsInfo }.
  */
-async function uploadIterationGroup(control, cfg, keys, baseParts, maxSockets, sourceFilePath, ipTputEnabled) {
-  // Create one multipart upload per key.
-  const uploadIds = {};
-  for (const key of keys) {
-    const create = await control.send(
-      new CreateMultipartUploadCommand({
-        Bucket: cfg.bucket,
-        Key: key,
-        ...(cfg.checksum ? { ChecksumAlgorithm: cfg.checksum } : {}),
-      }),
-    );
-    uploadIds[key] = create.UploadId;
-  }
+function runOpenStreamUpload({
+  bucket, region, keys, baseParts, workers, concurrency, checksum, maxSockets,
+  spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32,
+  progressBuf, reporter, onCreate, onComplete, openDesc, uploadMaxBuffered, carvers: nCarversCfg,
+}) {
+  const partSizeMax = baseParts.reduce((m, p) => Math.max(m, p.size), 0) || 1;
+  const perFileBytes = baseParts.reduce((s, p) => s + p.size, 0);
+  const totalParts = baseParts.length * keys.length;
+  const nUploaders = Math.max(1, Math.min(workers, totalParts));
+  const nCarvers = Math.max(1, Math.min(nCarversCfg > 0 ? nCarversCfg : keys.length, keys.length));
+  const lanesPerUploader = Math.max(1, concurrency);
+  const budget = uploadMaxBuffered > 0 ? uploadMaxBuffered : (nUploaders * lanesPerUploader + nCarvers) * partSizeMax;
+  const maxBuffers = Math.max(nUploaders * lanesPerUploader + nCarvers, Math.floor(budget / partSizeMax));
+  const carverLimit = Math.max(1, Math.floor(maxBuffers / nCarvers));
 
-  // Pool every key's parts into one work list, tagged with key + uploadId.
-  const parts = [];
-  for (const key of keys) {
-    for (const p of baseParts) parts.push({ ...p, key, uploadId: uploadIds[key] });
-  }
+  // Round-robin objects across carvers (a stream is sequential -> one carver/object).
+  const carverObjects = Array.from({ length: nCarvers }, () => []);
+  keys.forEach((key, i) => carverObjects[i % nCarvers].push(key));
+
+  return new Promise((resolve, reject) => {
+    const uploaders = [];
+    const carvers = [];
+    let uReady = 0;
+    let cReady = 0;
+    let started = false;
+    let settled = false;
+    let t0 = 0;
+    let tlsInfo = null;
+    let uploadedCount = 0;
+    let totalBytes = 0;
+    let uploadIds = {};
+    const completed = [];
+    const freeLanes = new Array(nUploaders).fill(lanesPerUploader);
+    const ready = []; // carved parts awaiting an uploader lane: { ..., carverId, buf }
+
+    const cleanup = () => {
+      reporter?.stop();
+      for (const w of uploaders) { try { w.terminate(); } catch { /* ignore */ } }
+      for (const w of carvers) { try { w.terminate(); } catch { /* ignore */ } }
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    const dispatch = () => {
+      for (let ui = 0; ui < nUploaders && ready.length; ui++) {
+        while (freeLanes[ui] > 0 && ready.length) {
+          const it = ready.shift();
+          freeLanes[ui] -= 1;
+          uploaders[ui].postMessage(
+            { type: 'upload', key: it.key, uploadId: it.uploadId, partNumber: it.partNumber, size: it.size, carverId: it.carverId, buffer: it.buf.buffer },
+            [it.buf.buffer],
+          );
+        }
+      }
+    };
+
+    const maybeBegin = () => {
+      if (started || uReady !== nUploaders || cReady !== nCarvers) return;
+      started = true;
+      (async () => {
+        try {
+          t0 = performance.now();
+          reporter?.start();
+          ({ uploadIds } = await onCreate());
+          for (let ci = 0; ci < nCarvers; ci++) {
+            const objects = carverObjects[ci].map((key) => ({ key, uploadId: uploadIds[key], size: perFileBytes, baseParts }));
+            carvers[ci].postMessage({ type: 'carve', objects });
+          }
+        } catch (err) {
+          fail(err);
+        }
+      })();
+    };
+
+    // Uploader tier (reuses the pool worker role).
+    for (let ui = 0; ui < nUploaders; ui++) {
+      const worker = new Worker(WORKER_PATH, {
+        workerData: {
+          role: 'uploader', bucket, region, concurrency, checksum, maxSockets,
+          spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32, workerId: ui, progressBuf,
+        },
+      });
+      uploaders.push(worker);
+      worker.on('message', (msg) => {
+        if (msg.type === 'ready') {
+          uReady += 1;
+          maybeBegin();
+        } else if (msg.type === 'uploaded') {
+          freeLanes[ui] += 1;
+          if (!tlsInfo && msg.tlsInfo) tlsInfo = msg.tlsInfo;
+          completed.push({ key: msg.key, PartNumber: msg.partNumber, ETag: msg.ETag, ChecksumCRC32C: msg.ChecksumCRC32C, ChecksumCRC32: msg.ChecksumCRC32, ChecksumSHA1: msg.ChecksumSHA1, ChecksumSHA256: msg.ChecksumSHA256 });
+          totalBytes += msg.size;
+          uploadedCount += 1;
+          // Ack the carver + hand the freed buffer back for reuse (credit + recycle).
+          carvers[msg.carverId]?.postMessage({ type: 'ack', buffer: msg.buffer }, [msg.buffer]);
+          if (uploadedCount === totalParts) {
+            if (!settled) {
+              (async () => {
+                try {
+                  await onComplete(completed);
+                  const wallMs = performance.now() - t0;
+                  settled = true;
+                  cleanup();
+                  resolve({ bytes: totalBytes, completed, wallMs, ipThroughput: [], tlsInfo });
+                } catch (err) {
+                  fail(err);
+                }
+              })();
+            }
+            return;
+          }
+          dispatch();
+        } else if (msg.type === 'error') {
+          fail(new Error(`uploader: ${msg.message}`));
+        }
+      });
+      worker.on('error', fail);
+      worker.on('exit', (code) => { if (code !== 0 && !settled) fail(new Error(`uploader exited with code ${code}`)); });
+    }
+
+    // Carver tier (one stream per object, carves parts, transfers to main).
+    for (let ci = 0; ci < nCarvers; ci++) {
+      const cid = ci;
+      const worker = new Worker(WORKER_PATH, {
+        workerData: {
+          role: 'carver', bucket, region, concurrency, checksum, maxSockets,
+          spreadConnections, tls, ipThroughput, httpHandler, ciphers, nativeCrc32, workerId: ci,
+          openDesc, maxPartSize: partSizeMax, carverLimit,
+        },
+      });
+      carvers.push(worker);
+      worker.on('message', (msg) => {
+        if (msg.type === 'ready') {
+          cReady += 1;
+          maybeBegin();
+        } else if (msg.type === 'part') {
+          ready.push({ key: msg.key, uploadId: msg.uploadId, partNumber: msg.partNumber, size: msg.size, carverId: cid, buf: Buffer.from(msg.buffer) });
+          dispatch();
+        } else if (msg.type === 'carver-done') {
+          /* informational; completion is driven by uploadedCount */
+        } else if (msg.type === 'error') {
+          fail(new Error(`carver: ${msg.message}`));
+        }
+      });
+      worker.on('error', fail);
+      worker.on('exit', (code) => { if (code !== 0 && !settled) fail(new Error(`carver exited with code ${code}`)); });
+    }
+  });
+}
+
+/**
+ * One iteration for a whole group. Worker spawn + data generation happen first,
+ * UNTIMED (main starts the clock only once every worker is ready). The measured
+ * window then spans the whole multipart lifecycle: CreateMultipartUpload -> parallel
+ * UploadPart -> CompleteMultipartUpload, so the reported throughput is end-to-end.
+ */
+async function uploadIterationGroup(control, cfg, keys, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf = null, reporter = null) {
+  const uploadIds = {};
+
+  // Create one MPU per key and build the pooled part list (key + uploadId tagged).
+  const onCreate = async () => {
+    for (const key of keys) {
+      const create = await control.send(
+        new CreateMultipartUploadCommand({
+          Bucket: cfg.bucket,
+          Key: key,
+          ...(cfg.checksum ? { ChecksumAlgorithm: cfg.checksum } : {}),
+        }),
+      );
+      uploadIds[key] = create.UploadId;
+    }
+    const parts = [];
+    for (const key of keys) {
+      for (const p of baseParts) parts.push({ ...p, key, uploadId: uploadIds[key] });
+    }
+    return { parts, uploadIds };
+  };
+
+  // Complete each MPU from the gathered part results.
+  const onComplete = async (completed) => {
+    const byKey = new Map(keys.map((k) => [k, []]));
+    for (const c of completed) byKey.get(c.key).push(c);
+    for (const key of keys) {
+      const orderedParts = byKey
+        .get(key)
+        .map(completedPart)
+        .sort((a, b) => a.PartNumber - b.PartNumber);
+      await control.send(
+        new CompleteMultipartUploadCommand({
+          Bucket: cfg.bucket,
+          Key: key,
+          UploadId: uploadIds[key],
+          MultipartUpload: { Parts: orderedParts },
+        }),
+      );
+    }
+  };
 
   const abortAll = async () => {
     for (const key of keys) {
+      if (!uploadIds[key]) continue;
       await control
         .send(new AbortMultipartUploadCommand({ Bucket: cfg.bucket, Key: key, UploadId: uploadIds[key] }))
         .catch(() => {});
     }
   };
 
-  let timed;
+  // 'open'/'open-stream' source: the re-openable descriptor each worker opens from.
+  // Built-in file opener gets the shared source file path; a custom module opener's
+  // path is resolved to an absolute file URL on MAIN (so the worker's import() is
+  // unambiguous — a relative specifier would otherwise resolve against the worker
+  // file, not the customer's cwd), with the source path passed through in params.
+  let openDesc = null;
+  if (cfg.uploadSource === 'open' || cfg.uploadSource === 'open-stream') {
+    if (cfg.uploadOpen?.module) {
+      openDesc = { module: pathToFileURL(path.resolve(cfg.uploadOpen.module)).href, params: { ...cfg.uploadOpen.params, sourceFilePath } };
+    } else if (cfg.uploadOpen?.type === 'memory') {
+      // In-memory opener: workers generate bytes from a template (no disk). The emit
+      // chunk size reuses uploadClientChunk.
+      openDesc = { type: 'memory', chunk: cfg.uploadClientChunk };
+    } else {
+      openDesc = { type: 'file', path: sourceFilePath };
+    }
+  }
+
+  const common = {
+    bucket: cfg.bucket,
+    region: cfg.region,
+    keys,
+    baseParts,
+    workers: cfg.workers,
+    concurrency: cfg.concurrency,
+    checksum: cfg.checksum,
+    maxSockets,
+    spreadConnections: cfg.spreadConnections,
+    tls: cfg.tls,
+    ipThroughput: ipTputEnabled,
+    httpHandler: cfg.httpHandler,
+    ciphers: cfg.ciphers,
+    nativeCrc32: cfg.nativeCrc32,
+    progressBuf,
+    reporter,
+    onCreate,
+    onComplete,
+  };
+
   try {
-    timed = await runOnce({
-      bucket: cfg.bucket,
-      region: cfg.region,
-      parts,
-      workers: Math.min(cfg.workers, parts.length),
-      concurrency: cfg.concurrency,
-      checksum: cfg.checksum,
-      maxSockets,
-      uploadSource: cfg.uploadSource,
-      sourceFilePath,
-      spreadConnections: cfg.spreadConnections,
-      tls: cfg.tls,
-      ipThroughput: ipTputEnabled,
-      httpHandler: cfg.httpHandler,
-      ciphers: cfg.ciphers,
-      nativeCrc32: cfg.nativeCrc32,
-    });
+    if (cfg.uploadSource === 'stream') {
+      // Customer streams each object into main; main carves + transfers parts to
+      // a pool of uploader workers that UploadPart in parallel, out of order.
+      return await runStreamUpload({ ...common, uploadMaxBuffered: cfg.uploadMaxBuffered, clientRate: cfg.uploadClientRate, clientChunk: cfg.uploadClientChunk });
+    }
+    if (cfg.uploadSource === 'open-stream') {
+      // Carver threads open whole-object streams and carve parts; a separate uploader
+      // pool does the UploadParts. Parts flow carver -> main -> uploader (zero-copy).
+      return await runOpenStreamUpload({ ...common, openDesc, uploadMaxBuffered: cfg.uploadMaxBuffered, carvers: cfg.uploadCarvers });
+    }
+    return await runOnce({ ...common, uploadSource: cfg.uploadSource, sourceFilePath, openDesc });
   } catch (err) {
     await abortAll();
     throw err;
   }
-
-  // Group completed parts by key and complete each multipart upload.
-  const byKey = new Map(keys.map((k) => [k, []]));
-  for (const c of timed.completed) byKey.get(c.key).push(c);
-  for (const key of keys) {
-    const orderedParts = byKey
-      .get(key)
-      .map(completedPart)
-      .sort((a, b) => a.PartNumber - b.PartNumber);
-    await control.send(
-      new CompleteMultipartUploadCommand({
-        Bucket: cfg.bucket,
-        Key: key,
-        UploadId: uploadIds[key],
-        MultipartUpload: { Parts: orderedParts },
-      }),
-    );
-  }
-
-  return timed;
 }
 
 async function benchmarkGroup(cfg, group) {
@@ -284,9 +726,20 @@ async function benchmarkGroup(cfg, group) {
   let sourceFilePath = null;
   const ipTputEnabled = cfg.ipThroughput || cfg.ipThroughputSizes.includes(group.label);
   const ipHistory = new Map();
+  const progressBuf = cfg.progress && !cfg.json ? newProgressBuffer() : null;
+  const progressLabel = keysToUpload.length > 1 ? `${group.label} x${keysToUpload.length}` : group.label;
+  const makeReporter = () =>
+    progressBuf ? new ProgressReporter(progressBuf, totalBytes, { label: progressLabel }) : null;
 
   try {
-    if (cfg.uploadSource === 'file') {
+    // 'file' and the built-in *file* opener of 'open'/'open-stream' need a source
+    // file. The 'memory' opener and module openers do not.
+    const needsSourceFile =
+      cfg.uploadSource === 'file' ||
+      ((cfg.uploadSource === 'open' || cfg.uploadSource === 'open-stream') &&
+        !cfg.uploadOpen?.module &&
+        (cfg.uploadOpen?.type ?? 'file') === 'file');
+    if (needsSourceFile) {
       mkdirSync(cfg.sourcePath, { recursive: true }); // createWriteStream won't create parents
       const safe = group.label.replace(/[^\w.-]/g, '_');
       sourceFilePath = path.join(cfg.sourcePath, `s3ulbench-src-${safe}`);
@@ -295,7 +748,7 @@ async function benchmarkGroup(cfg, group) {
     }
 
     for (let i = 0; i < cfg.warmup; i++) {
-      await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled);
+      await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, makeReporter());
     }
 
     const monitor = new ResourceMonitor();
@@ -303,7 +756,7 @@ async function benchmarkGroup(cfg, group) {
     const samples = [];
     let negotiatedTls = null;
     for (let i = 0; i < cfg.iterations; i++) {
-      const r = await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled);
+      const r = await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, makeReporter());
       const secs = r.wallMs / 1000;
       samples.push({ secs, ...throughput(r.bytes, secs) });
       if (!negotiatedTls && r.tlsInfo) negotiatedTls = r.tlsInfo;
@@ -377,7 +830,16 @@ function printHuman(cfg, all) {
   console.log(`node=${process.version}  sdk=@aws-sdk/client-s3@${SDK_VERSION}  @smithy/core@${SMITHY_CORE_VERSION}`);
   console.log(`region=${cfg.region ?? '(default)'}  bucket=${cfg.bucket}`);
   console.log(
-    `source=${cfg.uploadSource}  handler=${cfg.httpHandler}  transport=${uploadTlsNote(cfg, all)}  ` +
+    `source=${cfg.uploadSource}${
+      cfg.uploadSource === 'stream'
+        ? ` (main-carve->worker-pool, max-buffered ${cfg.uploadMaxBuffered > 0 ? formatBytes(cfg.uploadMaxBuffered) : 'auto'}, client-chunk ${formatBytes(cfg.uploadClientChunk)}${cfg.uploadClientRate > 0 ? `, client ${formatBytes(cfg.uploadClientRate)}/s` : ''})`
+        : cfg.uploadSource === 'open'
+          ? ` (worker-open ${cfg.uploadOpen?.module ? `module ${cfg.uploadOpen.module}` : (cfg.uploadOpen?.type ?? 'file')})`
+          : cfg.uploadSource === 'open-stream'
+            ? ` (carvers${cfg.uploadCarvers > 0 ? ` x${cfg.uploadCarvers}` : ' auto'} -> uploaders x${cfg.workers}, ${cfg.uploadOpen?.module ? `module ${cfg.uploadOpen.module}` : (cfg.uploadOpen?.type ?? 'file')})`
+            : ''
+    }  ` +
+      `handler=${cfg.httpHandler}  transport=${uploadTlsNote(cfg, all)}  ` +
       `part-size=${formatBytes(cfg.partSize)}  checksum=${cfg.checksum || 'off'}  ` +
       `spread-conns=${cfg.spreadConnections ? 'ON' : 'OFF'}  workers=${cfg.workers}  ` +
       `concurrency/worker=${cfg.concurrency}  iterations=${cfg.iterations} (warmup=${cfg.warmup})\n`,
