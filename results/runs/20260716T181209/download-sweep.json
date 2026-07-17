@@ -1,0 +1,112 @@
+{
+  "goVersion": "go1.26.5",
+  "sdkVersion": "v1.105.1",
+  "config": {
+    "bucket": "s3dl-bench-usw2-801400661003",
+    "region": "us-west-2",
+    "dataPrefix": "bench/",
+    "codePrefix": "code-go/",
+    "sizes": [
+      {
+        "size": "30GiB",
+        "count": 10
+      }
+    ],
+    "partSize": "32MiB",
+    "checksum": "CRC32",
+    "download": {
+      "workers": 64,
+      "concurrency": 8,
+      "iterations": 1,
+      "warmup": 1,
+      "validateChecksum": true,
+      "spreadConnections": true,
+      "tls": true,
+      "deliveryMode": "discard",
+      "deliveryPath": "/tmp",
+      "maxBufferedBytes": 68719476736,
+      "maxRetries": 2,
+      "stallTimeoutMs": 30000
+    },
+    "upload": {
+      "workers": 64,
+      "concurrency": 8,
+      "iterations": 1,
+      "warmup": 0,
+      "keyPrefix": "bench-upload/",
+      "maxRetries": 2,
+      "stallTimeoutMs": 30000
+    },
+    "sampling": {
+      "enabled": true,
+      "intervalMs": 250
+    },
+    "results": {
+      "dir": "results",
+      "plot": true,
+      "upload": true,
+      "bucket": "",
+      "prefix": "results/runs/"
+    }
+  },
+  "results": [
+    {
+      "label": "30GiB",
+      "files": 10,
+      "perFileSize": 32212254720,
+      "size": 322122547200,
+      "parts": 9600,
+      "checksumAlgo": "CRC32",
+      "checksumValidated": true,
+      "deliveryMode": "discard",
+      "partsChecksummedPerRun": 9600,
+      "workers": 64,
+      "concurrency": 8,
+      "totalInFlight": 512,
+      "iterations": 1,
+      "samples": [
+        {
+          "secs": 13.920222583,
+          "mibps": 22068.612636637466,
+          "gbps": 185.12494051259816
+        }
+      ],
+      "median": {
+        "secs": 13.920222583,
+        "mibps": 22068.612636637466,
+        "gbps": 185.12494051259816
+      },
+      "best": {
+        "secs": 13.920222583,
+        "mibps": 22068.612636637466,
+        "gbps": 185.12494051259816
+      },
+      "resources": {
+        "peakRssBytes": 177942528,
+        "avgRssBytes": 170318901.89473686,
+        "peakCpuPercent": 38.750113305331304,
+        "avgCpuPercent": 35.69956191118461,
+        "peakMemUtilPercent": 0.13414612531285477,
+        "cpuCount": 64,
+        "totalMemBytes": 132648280064,
+        "samples": 114
+      },
+      "connectionSpread": null,
+      "ipThroughput": null,
+      "partTimeStats": {
+        "count": 19200,
+        "min": 338.134263,
+        "p50": 634.061581,
+        "p90": 1145.877315,
+        "p99": 1802.976035,
+        "p999": 2280.137203,
+        "max": 2785.23714,
+        "mean": 722.9992934415625
+      },
+      "tlsInfo": {
+        "protocol": "",
+        "cipher": ""
+      }
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+=== S3 Transfer Manager DOWNLOAD benchmark (feature/s3/transfermanager) ===
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003  sink=memory(discard)
+object-concurrency=10  per-object part-concurrency=12  ~parts-in-flight=120  iterations=1 (warmup=0)
+
+
+throughput (median over measured iterations):
+size              parts   files    med Gbps    med MiB/s
+--------------------------------------------------------
+30GiB                 0      10      43.051       5132.1
+
+resource usage (whole process, during the sampled run):
+size               peak RSS    avg RSS  peak CPU   avg CPU  peak MEM
+----------------------------------------------------------------------
+30GiB             95.69 GiB  76.30 GiB       60%       33%     77.5%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)

@@ -1,0 +1,43 @@
+=== S3 multipart UPLOAD benchmark (AWS SDK Go v2) ===
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003  keyPrefix=bench-upload/
+source=memory  part-size=32MiB  checksum=CRC32  spread-conns=true  workers=64  concurrency/worker=4  iterations=1 (warmup=0)
+
+
+throughput (median over measured iterations):
+size              parts   files    med Gbps    med MiB/s
+--------------------------------------------------------
+30GiB              9600      10     123.616      14736.2
+  front-end IPs=8  conn-reuse=97%  retries=0
+
+resource usage (whole process, during the sampled run):
+size               peak RSS    avg RSS  peak CPU   avg CPU  peak MEM
+----------------------------------------------------------------------
+30GiB            183.62 MiB 170.44 MiB       36%       18%      0.1%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+
+per-part upload time (ms), across all measured iterations:
+size                parts      min      p50      p90      p99    p99.9      max     mean
+--------------------------------------------------------------------------------------
+30GiB                9600    306.8    355.3    452.5    632.0    827.6   1197.0    374.7
+=== S3 part-boundary download benchmark (AWS SDK Go v2) ===
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003
+unit=PartNumber  delivery=ordered-stream (buffer-pool, max-buffered=64GiB)  checksum-validation=true  spread-conns=true  workers=64  concurrency/worker=4  iterations=1 (warmup=1)
+
+
+throughput (median over measured iterations):
+size              parts   files    med Gbps    med MiB/s
+--------------------------------------------------------
+30GiB              9600      10     161.423      19243.2
+  ttfb ms  p50=131.8 p90=171.5 p99=219.4 p99.9=284.0
+  front-end IPs=31  conn-reuse=100%  retries=0
+
+resource usage (whole process, during the sampled run):
+size               peak RSS    avg RSS  peak CPU   avg CPU  peak MEM
+----------------------------------------------------------------------
+30GiB             26.35 GiB  24.94 GiB       53%       33%     21.3%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+
+per-part download time (ms), across all measured iterations:
+size                parts      min      p50      p90      p99    p99.9      max     mean
+--------------------------------------------------------------------------------------
+30GiB               19200    337.2    389.2    547.3    770.8   1039.2   1446.6    419.7

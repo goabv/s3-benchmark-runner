@@ -36,7 +36,6 @@
   "upload": {
     "workers": 64,
     "concurrency": 4,
-    "carvers": 4,
     "iterations": 1,
     "warmup": 0,
     "httpHandler": "node",

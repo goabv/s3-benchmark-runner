@@ -1,0 +1,36 @@
+=== S3 Transfer Manager UPLOAD benchmark (feature/s3/transfermanager) ===
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003  keyPrefix=tm-upload/  source=memory
+object-concurrency=10  per-object part-concurrency=25  ~parts-in-flight=250  iterations=1 (warmup=0)
+
+size          parts   files   med Gbps  med MiB/s
+--------------------------------------------------------
+30GiB          9600      10    171.415    20434.3
+=== S3 Transfer Manager DOWNLOAD benchmark (feature/s3/transfermanager) ===
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003  sink=memory(discard)
+object-concurrency=10  per-object part-concurrency=25  ~parts-in-flight=250  iterations=1 (warmup=1)
+
+size          parts   files   med Gbps  med MiB/s
+--------------------------------------------------------
+30GiB             0      10     30.792     3670.7
+
+resource usage (whole process, during the sampled run):
+size               peak RSS    avg RSS  peak CPU   avg CPU  peak MEM
+----------------------------------------------------------------------
+30GiB             95.72 GiB  76.42 GiB       94%       46%     77.5%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+
+per-part download time (ms), across all measured iterations:
+size                parts      min      p50      p90      p99    p99.9      max     mean
+--------------------------------------------------------------------------------------
+30GiB                   0      0.0      0.0      0.0      0.0      0.0      0.0      0.0
+
+resource usage (whole process, during the sampled run):
+size               peak RSS    avg RSS  peak CPU   avg CPU  peak MEM
+----------------------------------------------------------------------
+30GiB             95.72 GiB  76.42 GiB       94%       46%     77.5%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+
+per-part download time (ms), across all measured iterations:
+size                parts      min      p50      p90      p99    p99.9      max     mean
+--------------------------------------------------------------------------------------
+30GiB                   0      0.0      0.0      0.0      0.0      0.0      0.0      0.0

@@ -1,0 +1,48 @@
+{
+  "bucket": "s3dl-bench-usw2-801400661003",
+  "region": "us-west-2",
+  "dataPrefix": "bench/",
+  "codePrefix": "code-go/",
+  "sizes": [
+    {
+      "size": "30GiB",
+      "count": 10
+    }
+  ],
+  "partSize": "32MiB",
+  "checksum": "CRC32",
+  "download": {
+    "workers": 64,
+    "concurrency": 4,
+    "iterations": 1,
+    "warmup": 1,
+    "validateChecksum": true,
+    "spreadConnections": true,
+    "tls": true,
+    "deliveryMode": "ordered-stream",
+    "deliveryPath": "/tmp",
+    "maxBufferedBytes": 68719476736,
+    "maxRetries": 2,
+    "stallTimeoutMs": 30000
+  },
+  "upload": {
+    "workers": 64,
+    "concurrency": 4,
+    "iterations": 1,
+    "warmup": 0,
+    "keyPrefix": "bench-upload/",
+    "maxRetries": 2,
+    "stallTimeoutMs": 30000
+  },
+  "sampling": {
+    "enabled": true,
+    "intervalMs": 250
+  },
+  "results": {
+    "dir": "results",
+    "plot": true,
+    "upload": true,
+    "bucket": "",
+    "prefix": "results/runs/"
+  }
+}

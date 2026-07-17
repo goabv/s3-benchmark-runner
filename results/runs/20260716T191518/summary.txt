@@ -1,0 +1,22 @@
+=== S3 part-boundary download benchmark (AWS SDK Go v2) ===
+region=us-west-2  bucket=s3dl-bench-usw2-801400661003
+unit=PartNumber  delivery=ordered-stream (buffer-pool, max-buffered=64GiB)  checksum-validation=true  spread-conns=true  workers=64  concurrency/worker=8  iterations=1 (warmup=0)
+
+
+throughput (median over measured iterations):
+size              parts   files    med Gbps    med MiB/s
+--------------------------------------------------------
+30GiB              9600      10     179.205      21363.0
+  ttfb ms  p50=132.2 p90=184.9 p99=336.0 p99.9=393.7
+  front-end IPs=8  conn-reuse=95%  retries=0
+
+resource usage (whole process, during the sampled run):
+size               peak RSS    avg RSS  peak CPU   avg CPU  peak MEM
+----------------------------------------------------------------------
+30GiB             55.72 GiB  49.09 GiB       69%       46%     45.1%
+(CPU% is of all 64 cores; MEM% is of 123.54 GiB total RAM)
+
+per-part download time (ms), across all measured iterations:
+size                parts      min      p50      p90      p99    p99.9      max     mean
+--------------------------------------------------------------------------------------
+30GiB                9600    338.4    638.2   1256.9   2048.4   2552.1   3240.7    736.0
