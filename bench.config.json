@@ -41,7 +41,7 @@
     "warmup": 0,
     "httpHandler": "node",
     "forceUpload": false,
-    "uploadSource": "open-stream",
+    "uploadSource": "memory",
     "spreadConnections": true,
     "ipThroughputSizes": []
   }
