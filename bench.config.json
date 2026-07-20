@@ -34,8 +34,8 @@
   },
 
   "upload": {
-    "workers": 64,
-    "concurrency": 4,
+    "workers": 60,
+    "concurrency": 6,
     "carvers": 4,
     "iterations": 1,
     "warmup": 0,
