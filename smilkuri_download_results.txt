@@ -1,0 +1,13 @@
+=== Workload: /home/ec2-user/repo/aws-crt-s3-benchmarks/workloads/download-5GiB-1x-ram.run.json ===
+Workers: 64 | Concurrency/worker: 4 | Tasks: 1
+
+Run:1 Secs:1.502773 Gb/s:28.580276
+Run:2 Secs:0.706484 Gb/s:60.793545
+Run:3 Secs:0.582793 Gb/s:73.696262
+Run:4 Secs:0.512444 Gb/s:83.813360
+Run:5 Secs:0.592704 Gb/s:72.463984
+Run:6 Secs:0.639321 Gb/s:67.180113
+Run:7 Secs:0.583642 Gb/s:73.589117
+Run:8 Secs:0.566287 Gb/s:75.844334
+Run:9 Secs:0.657547 Gb/s:65.317986
+Run:10 Secs:0.738795 Gb/s:58.134796
