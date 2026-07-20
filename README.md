@@ -184,6 +184,7 @@ A representative config (this repo's current one):
 | `iterations` | `1` | Measured upload runs per size. |
 | `warmup` | `1` | Unmeasured priming run. |
 | `forceUpload` | `false` | If `true`, upload even when a matching object already exists; otherwise skip objects whose size **and** part size already match. |
+| `api` | `true` (default) | Route the upload through the `S3TransferManager` API — **the default and recommended path**. The uploader pool is constructed **once** (spawn + client init = one-time, reported separately); each iteration fires **x concurrent `upload()` calls** (one per object), each fed a customer `Readable` from **main** (a synthetic stream here). The manager carves each stream into parts and fans them out to the pool, running the full `CreateMPU → UploadPart → CompleteMPU` per object. `uploadSource` is ignored on this path. Set `api:false` / `--no-api` for the legacy `uploadSource` loop. |
 | `uploadSource` | `memory` | Where part bytes come from: `memory` (one object-sized `SharedArrayBuffer` per object, filled once; parts are zero-copy views — resident memory = sum of object sizes, preflight-guarded), `file` (read each part from disk inline — measures disk + upload), `stream` (the customer hands one `Readable` per object to main; main carves + transfers parts to a pool of uploader threads), `open` (the customer passes a re-openable source descriptor; each worker opens its own stream for its part range — distributes ingress across cores), or `open-stream` (carver threads open whole-object streams, a separate uploader pool sends). See the Data source section below. |
 | `uploadOpen` | `{ "type": "file" }` | **open / open-stream only.** The source descriptor: `{ "type": "file" }` (read the shared source file), `{ "type": "memory" }` (generate bytes in-memory on each worker — no disk, fastest ingress). Fixed built-in openers only. |
 | `uploadCarvers` | `0` (auto) | **open-stream only.** Number of carver threads. `0` = one per object; set lower to put multiple objects on each carver (they're carved sequentially). Carvers + uploaders (`workers`) are separate pools, so total threads ≈ `carvers + workers`. |
@@ -496,10 +497,23 @@ the `download` section:
 ### Download API (`S3TransferManager`)
 
 By default (`download.api: true`) the benchmark runs through a Transfer-Manager-shaped
-wrapper, `S3TransferManager`. This makes the measurement boundary match a real transfer
-manager's public API: construct once, then call `download()` per object. It always
-delivers to per-object streams, so `deliveryMode` is ignored in this path. Set
-`api:false` / `--no-api` to use the legacy `deliveryMode` run loop instead.
+wrapper, `S3TransferManager` (the same class serves uploads via `upload()`/`uploadMany()`
+— see below). This makes the measurement boundary match a real transfer manager's public
+API: construct once, then call `download()` per object. It always delivers to per-object
+streams; `deliveryMode` selects only the **destination** the harness drains each stream to:
+`file` pipes the ordered stream to a local file (download-to-disk), and anything else
+(`discard`/`ordered-drop`/`ordered-stream`) drains to a discard sink (pure throughput; a
+slow reader can be modeled with `consumerRate`). Set `api:false` / `--no-api` to use the
+legacy `deliveryMode` run loop instead.
+
+**Uploads use the same manager.** `upload({ bucket, key, body })` takes a customer
+`Readable` from main; the manager runs `CreateMPU`, carves the stream into `partSize`
+buffers on main (single-thread ingress + memcpy — a `Readable` can't cross the worker
+boundary), transfers each part zero-copy to a warm uploader pool that does parallel
+`UploadPart`, then `CompleteMPU`. `uploadMany({ sources })` runs many through one pool +
+one `uploadMaxBuffered` budget. The upload benchmark uses this by default (`upload.api`),
+firing x concurrent `upload()` calls fed by synthetic customer streams; window =
+`CreateMPU → CompleteMPU`, pool spawn one-time.
 
 ```js
 const tm = new S3TransferManager(cfg);      // spawns the worker pool ONCE (one-time cost)
@@ -1041,6 +1055,7 @@ Shares the tuning flags above (`--workers`, `--concurrency`, `--iterations`,
 | `--client-rate <size>` | `uploadClientRate` | stream source: throttle simulated client bytes/sec (0 = unlimited) |
 | `--client-chunk <size>` | `uploadClientChunk` | stream source: simulated client push chunk size (default 1MiB) |
 | `--source-path <dir>` | `sourcePath` | Dir for the `file` source temp file |
+| `--no-api` | `api:false` | Disable the default `S3TransferManager` upload API; use the legacy `uploadSource` loop |
 | `--force` | `forceUpload` | Upload even if a matching object exists |
 
 ### Seed (`src/upload-test-data.js`)

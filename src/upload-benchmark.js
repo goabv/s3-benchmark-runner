@@ -17,6 +17,7 @@ import { makeClient } from './s3.js';
 import { parseUploadArgs, parseSize, computeParts, formatBytes, throughput } from './config.js';
 import { ResourceMonitor } from './resource-monitor.js';
 import { newProgressBuffer, ProgressReporter } from './progress.js';
+import { S3TransferManager } from './transfer-manager.js';
 import {
   mergeIpThroughput,
   ipIterationGbps,
@@ -722,6 +723,33 @@ function allocObjectBuffers(keys, size, { json } = {}) {
   return buffers;
 }
 
+/**
+ * API-mode upload run: drive the persistent S3TransferManager as a customer would —
+ * fire one upload() per object CONCURRENTLY (x calls for x objects), each fed a
+ * customer Readable from MAIN (here a synthetic stream). The manager carves each
+ * stream and fans parts out to the warm uploader pool, running the full multipart
+ * lifecycle per object. Measured window = first upload() (CreateMPU) -> last
+ * CompleteMPU; the pool spawn is one-time (in the constructor).
+ */
+async function runUploadViaManager(manager, cfg, keys, bytes, template, reporter) {
+  manager.resetScheduler();
+  const t0 = performance.now();
+  reporter?.start();
+  const results = await Promise.all(
+    keys.map((key) =>
+      manager.upload({
+        bucket: cfg.bucket,
+        key,
+        body: makeCustomerStream(bytes, template, cfg.uploadClientRate),
+      }),
+    ),
+  );
+  const wallMs = performance.now() - t0;
+  reporter?.stop();
+  const totalBytes = results.reduce((s, r) => s + r.bytes, 0);
+  return { bytes: totalBytes, wallMs, completed: [], ipThroughput: [], tlsInfo: manager.tlsInfo };
+}
+
 async function benchmarkGroup(cfg, group) {
   const bytes = parseSize(group.label);
   const baseParts = computeParts(bytes, cfg.partSize);
@@ -770,13 +798,22 @@ async function benchmarkGroup(cfg, group) {
   const makeReporter = () =>
     progressBuf ? new ProgressReporter(progressBuf, totalBytes, { label: progressLabel }) : null;
 
+  // API mode (DEFAULT): the customer hands one Readable per object from MAIN and the
+  // S3TransferManager carves + fans out to a warm uploader pool. Legacy source setup
+  // (source file / SharedArrayBuffers) is skipped — the synthetic customer stream is
+  // generated on the fly from a small template.
+  const useApi = cfg.api;
+  let manager = null;
+  let spawnMs = 0;
+
   try {
     // 'file' and the 'file' opener of 'open'/'open-stream' need a source file;
-    // the 'memory' opener generates bytes in-memory, so it does not.
+    // the 'memory' opener generates bytes in-memory, so it does not. (Legacy only.)
     const needsSourceFile =
-      cfg.uploadSource === 'file' ||
-      ((cfg.uploadSource === 'open' || cfg.uploadSource === 'open-stream') &&
-        (cfg.uploadOpen?.type ?? 'file') === 'file');
+      !useApi &&
+      (cfg.uploadSource === 'file' ||
+        ((cfg.uploadSource === 'open' || cfg.uploadSource === 'open-stream') &&
+          (cfg.uploadOpen?.type ?? 'file') === 'file'));
     if (needsSourceFile) {
       mkdirSync(cfg.sourcePath, { recursive: true }); // createWriteStream won't create parents
       const safe = group.label.replace(/[^\w.-]/g, '_');
@@ -785,13 +822,42 @@ async function benchmarkGroup(cfg, group) {
       await writeRandomFile(sourceFilePath, bytes);
     }
 
-    // 'memory': one object-sized SharedArrayBuffer per object, filled once and
-    // reused across warmup + timed iterations (allocation is untimed).
+    // 'memory' (legacy): one object-sized SharedArrayBuffer per object (untimed).
     const objectBuffers =
-      cfg.uploadSource === 'memory' ? allocObjectBuffers(keysToUpload, bytes, { json: cfg.json }) : null;
+      !useApi && cfg.uploadSource === 'memory' ? allocObjectBuffers(keysToUpload, bytes, { json: cfg.json }) : null;
+
+    // API mode: construct the persistent uploader pool ONCE + a customer-stream template.
+    let template = null;
+    if (useApi) {
+      manager = new S3TransferManager({
+        bucket: cfg.bucket,
+        region: cfg.region,
+        mode: 'upload',
+        workers: cfg.workers,
+        concurrency: cfg.concurrency,
+        partSize: cfg.partSize,
+        checksum: cfg.checksum,
+        uploadMaxBuffered: cfg.uploadMaxBuffered,
+        spreadConnections: cfg.spreadConnections,
+        tls: cfg.tls,
+        ciphers: cfg.ciphers,
+        httpHandler: cfg.httpHandler,
+        nativeCrc32: cfg.nativeCrc32,
+        progressBuf,
+        ipThroughput: ipTputEnabled,
+      });
+      await manager.ready(); // one-time uploader-pool spawn + client init (untimed)
+      template = Buffer.allocUnsafe(Math.max(1, cfg.uploadClientChunk || 1 << 20));
+      randomFillSync(template);
+    }
+
+    const doUpload = (reporter) =>
+      useApi
+        ? runUploadViaManager(manager, cfg, keysToUpload, bytes, template, reporter)
+        : uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, reporter, objectBuffers);
 
     for (let i = 0; i < cfg.warmup; i++) {
-      await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, makeReporter(), objectBuffers);
+      await doUpload(makeReporter());
     }
 
     const monitor = new ResourceMonitor();
@@ -799,13 +865,14 @@ async function benchmarkGroup(cfg, group) {
     const samples = [];
     let negotiatedTls = null;
     for (let i = 0; i < cfg.iterations; i++) {
-      const r = await uploadIterationGroup(control, cfg, keysToUpload, baseParts, maxSockets, sourceFilePath, ipTputEnabled, progressBuf, makeReporter(), objectBuffers);
+      const r = await doUpload(makeReporter());
       const secs = r.wallMs / 1000;
       samples.push({ secs, ...throughput(r.bytes, secs) });
       if (!negotiatedTls && r.tlsInfo) negotiatedTls = r.tlsInfo;
-      if (ipTputEnabled) accumulateIpSamples(ipHistory, ipIterationGbps(new Map(r.ipThroughput)));
+      if (ipTputEnabled && r.ipThroughput) accumulateIpSamples(ipHistory, ipIterationGbps(new Map(r.ipThroughput)));
     }
     const resources = monitor.stop();
+    if (manager) spawnMs = (await manager.close()).spawnMs;
 
     let ipThroughputRows = null;
     if (ipTputEnabled) {
@@ -847,6 +914,8 @@ async function benchmarkGroup(cfg, group) {
       concurrency: cfg.concurrency,
       totalInFlight: workers * cfg.concurrency,
       iterations: cfg.iterations,
+      api: useApi,
+      spawnMs, // API mode: one-time uploader-pool spawn + client init (NOT in any Gbps)
       samples,
       median: { secs: median.secs, mibps: median.mibps, gbps: median.gbps },
       best: { secs: best.secs, mibps: best.mibps, gbps: best.gbps },
@@ -855,6 +924,7 @@ async function benchmarkGroup(cfg, group) {
       tlsInfo: negotiatedTls,
     };
   } finally {
+    if (manager && !manager._closePromise) await manager.close().catch(() => {});
     if (sourceFilePath) rmSync(sourceFilePath, { force: true });
     control.destroy();
   }
@@ -873,8 +943,11 @@ function printHuman(cfg, all) {
   console.log(`node=${process.version}  sdk=@aws-sdk/client-s3@${SDK_VERSION}  @smithy/core@${SMITHY_CORE_VERSION}`);
   console.log(`region=${cfg.region ?? '(default)'}  bucket=${cfg.bucket}`);
   console.log(
-    `source=${cfg.uploadSource}${
-      cfg.uploadSource === 'stream'
+    `${all.some((r) => r.api) ? 'api=S3TransferManager (x concurrent upload() from main streams + carve/fan-out)  ' : ''}` +
+    `source=${all.some((r) => r.api) ? 'stream-from-main' : cfg.uploadSource}${
+      all.some((r) => r.api)
+        ? ` (customer Readable -> main carve -> uploader pool, max-buffered ${cfg.uploadMaxBuffered > 0 ? formatBytes(cfg.uploadMaxBuffered) : 'auto'}, client-chunk ${formatBytes(cfg.uploadClientChunk)}${cfg.uploadClientRate > 0 ? `, client ${formatBytes(cfg.uploadClientRate)}/s` : ''})`
+        : cfg.uploadSource === 'stream'
         ? ` (main-carve->worker-pool, max-buffered ${cfg.uploadMaxBuffered > 0 ? formatBytes(cfg.uploadMaxBuffered) : 'auto'}, client-chunk ${formatBytes(cfg.uploadClientChunk)}${cfg.uploadClientRate > 0 ? `, client ${formatBytes(cfg.uploadClientRate)}/s` : ''})`
         : cfg.uploadSource === 'open'
           ? ` (worker-open ${cfg.uploadOpen?.type ?? 'file'})`
@@ -910,6 +983,13 @@ function printHuman(cfg, all) {
     );
   }
   console.log('');
+  if (all.some((r) => r.api)) {
+    console.log(
+      `(S3TransferManager API: med/best Gbps = full upload() call CreateMPU -> UploadPart -> ` +
+        `CompleteMPU. One-time uploader-pool spawn + client init (excluded): ` +
+        `${all.map((r) => `${r.label} ${(r.spawnMs ?? 0).toFixed(0)}ms`).join(', ')})`,
+    );
+  }
   printResources(all);
   for (const r of all) if (r.ipThroughput) printIpThroughput(r.label, r.ipThroughput);
 }

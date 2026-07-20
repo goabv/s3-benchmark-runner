@@ -2,7 +2,7 @@
 import { Worker } from 'node:worker_threads';
 import { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { writeFileSync, mkdirSync, openSync, ftruncateSync, closeSync, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, openSync, ftruncateSync, closeSync, rmSync, createWriteStream } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -639,36 +639,54 @@ function writeTimeseries(cfg, label, tsByIter) {
  * returned per-object Readables CONCURRENTLY. The measured window is the full
  * "first download() call -> last stream drained" (HEAD + planning are inside it);
  * the pool is already warm (spawn/init happened in the manager constructor).
+ *
+ * The destination (what the caller does with each stream) covers the "modes":
+ *   deliveryMode 'file'  -> pipe the ordered stream to a local file (download-to-disk)
+ *   otherwise            -> drain to a discard sink (pure throughput; covers discard /
+ *                           ordered-drop / ordered-stream, which all just consume bytes)
+ * A slow consumer can still be modeled with consumerRate on the discard sink.
  */
-async function runViaManager(manager, cfg, group, reporter) {
+async function runViaManager(manager, cfg, group, reporter, filePaths) {
   manager.resetScheduler();
   const hwm = cfg.streamHwm > 0 ? cfg.streamHwm : 2 * (1 << 20);
+  const toFile = cfg.deliveryMode === 'file' && filePaths;
   const t0 = performance.now();
   reporter?.start();
   // x concurrent download() calls (one per object) sharing the one pool + budget.
   const handles = await Promise.all(group.keys.map((key) => manager.download({ bucket: cfg.bucket, key })));
   let bytes = 0;
-  // Drain every object's stream concurrently into a discard (optionally throttled) sink.
   await Promise.all(
     handles.map(
-      ({ body }) =>
+      ({ key, body }) =>
         new Promise((resolve, reject) => {
-          const sink = new Writable({
-            highWaterMark: hwm,
-            write(chunk, _enc, cb) {
-              bytes += chunk.length;
-              const done = () => {
-                manager.recycle(chunk); // return the buffer to its worker (bufferReturn)
-                cb();
-              };
-              if (cfg.consumerRate > 0) setTimeout(done, (chunk.length / cfg.consumerRate) * 1000);
-              else done();
-            },
-          });
-          body.on('error', reject);
-          sink.on('error', reject);
-          sink.on('finish', resolve);
-          body.pipe(sink);
+          if (toFile) {
+            // Download-to-disk: pipe the in-order stream to the per-object file. No
+            // buffer recycling (the write stream owns each chunk until it's flushed).
+            const ws = createWriteStream(filePaths[key]);
+            ws.on('error', reject);
+            ws.on('finish', resolve);
+            body.on('error', reject);
+            body.on('data', (c) => (bytes += c.length));
+            body.pipe(ws);
+          } else {
+            // Discard (optionally throttled) sink; recycle each buffer after use.
+            const sink = new Writable({
+              highWaterMark: hwm,
+              write(chunk, _enc, cb) {
+                bytes += chunk.length;
+                const done = () => {
+                  manager.recycle(chunk); // return the buffer to its worker (bufferReturn)
+                  cb();
+                };
+                if (cfg.consumerRate > 0) setTimeout(done, (chunk.length / cfg.consumerRate) * 1000);
+                else done();
+              },
+            });
+            body.on('error', reject);
+            sink.on('error', reject);
+            sink.on('finish', resolve);
+            body.pipe(sink);
+          }
         }),
     ),
   );
@@ -822,7 +840,7 @@ async function benchmarkGroup(cfg, group) {
 
   const doRun = (reporter) =>
     useApi
-      ? runViaManager(manager, cfg, group, reporter)
+      ? runViaManager(manager, cfg, group, reporter, filePaths)
       : isOrderedMode(cfg.deliveryMode)
         ? runOrdered({ ...runCfg, reporter })
         : runOnce({ ...runCfg, reporter });

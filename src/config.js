@@ -592,6 +592,12 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     partSize: parseSize(args['part-size'] ?? pick('partSize') ?? '64MiB'),
     checksum: (args.checksum ?? pick('checksum') ?? 'CRC32C').toUpperCase(),
     uploadSource,
+    // Route the upload through the S3TransferManager API (persistent warm uploader
+    // pool constructed once; each iteration calls upload() per object concurrently,
+    // each fed a customer Readable from MAIN which the manager carves + fans out).
+    // DEFAULT path; the measured window is the full CreateMPU -> UploadPart ->
+    // CompleteMPU. api:false / --no-api falls back to the legacy uploadSource loop.
+    api: args['no-api'] ? false : (pick('api') ?? true),
     // 'open' / 'open-stream' source: which built-in opener each worker uses.
     //   file   - read from the shared source file ('open' = byte ranges,
     //            'open-stream' = whole object)
