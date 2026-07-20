@@ -189,10 +189,22 @@ if (role === 'carver') {
   parentPort.postMessage({ type: 'ready' });
 }
 // ---------------------------------------------------------------------------
-// UPLOADER / POOL role (uploadSource 'stream', or open-stream uploader tier):
-// upload transferred part buffers on demand, echoing any carverId back.
+// UPLOADER / POOL role: upload part bytes on demand. The bytes arrive one of three
+// ways: a TRANSFERRED buffer ('upload', from parts/stream carve), a shared-buffer
+// SLICE ('upload-sab'), or a positional FILE range this worker reads itself
+// ('upload-file' — distributed ingress).
 // ---------------------------------------------------------------------------
 else if (role === 'uploader' || uploadSource === 'stream') {
+  // Cache one fd per source file for positional reads (upload-file).
+  const uploaderFds = new Map();
+  const fdForFile = (p) => {
+    let fd = uploaderFds.get(p);
+    if (fd === undefined) {
+      fd = openSync(p, 'r');
+      uploaderFds.set(p, fd);
+    }
+    return fd;
+  };
   parentPort.on('message', async (msg) => {
     if (msg?.type === 'upload') {
       try {
@@ -223,7 +235,74 @@ else if (role === 'uploader' || uploadSource === 'stream') {
       } catch (err) {
         parentPort.postMessage({ type: 'error', message: err?.message ?? String(err) });
       }
+    } else if (msg?.type === 'upload-sab') {
+      // SAB mode: bytes live in a shared buffer (not transferred). Read this part's
+      // zero-copy slice and upload it; the SAB stays valid on main for reuse.
+      try {
+        const body = Buffer.from(msg.sab, msg.start, msg.size);
+        const r = await sendPartBody(
+          { key: msg.key, uploadId: msg.uploadId, partNumber: msg.partNumber, size: msg.size },
+          body,
+        );
+        bumpProgress(progress, msg.size);
+        parentPort.postMessage({
+          type: 'uploaded',
+          key: r.key,
+          partNumber: r.PartNumber,
+          size: r.size,
+          ETag: r.ETag,
+          ChecksumCRC32C: r.ChecksumCRC32C,
+          ChecksumCRC32: r.ChecksumCRC32,
+          ChecksumSHA1: r.ChecksumSHA1,
+          ChecksumSHA256: r.ChecksumSHA256,
+          tlsInfo,
+          // no buffer field: SAB is shared, nothing to transfer back
+        });
+      } catch (err) {
+        parentPort.postMessage({ type: 'error', message: err?.message ?? String(err) });
+      }
+    } else if (msg?.type === 'upload-file') {
+      // file mode: read THIS part's byte range from the file (positional, this worker
+      // does its own I/O — distributed ingress), then upload it.
+      try {
+        const fd = fdForFile(msg.file);
+        const body = Buffer.allocUnsafeSlow(msg.size);
+        let read = 0;
+        while (read < msg.size) {
+          const n = readSync(fd, body, read, msg.size - read, msg.start + read);
+          if (n === 0) break;
+          read += n;
+        }
+        const r = await sendPartBody(
+          { key: msg.key, uploadId: msg.uploadId, partNumber: msg.partNumber, size: msg.size },
+          body,
+        );
+        bumpProgress(progress, msg.size);
+        parentPort.postMessage({
+          type: 'uploaded',
+          key: r.key,
+          partNumber: r.PartNumber,
+          size: r.size,
+          ETag: r.ETag,
+          ChecksumCRC32C: r.ChecksumCRC32C,
+          ChecksumCRC32: r.ChecksumCRC32,
+          ChecksumSHA1: r.ChecksumSHA1,
+          ChecksumSHA256: r.ChecksumSHA256,
+          tlsInfo,
+          // no buffer field: the worker allocated its own read buffer (GC'd here)
+        });
+      } catch (err) {
+        parentPort.postMessage({ type: 'error', message: err?.message ?? String(err) });
+      }
     } else if (msg?.type === 'stop') {
+      for (const fd of uploaderFds.values()) {
+        try {
+          closeSync(fd);
+        } catch {
+          /* ignore */
+        }
+      }
+      uploaderFds.clear();
       try {
         client.destroy();
       } catch {

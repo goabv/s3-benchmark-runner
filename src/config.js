@@ -470,27 +470,22 @@ Options (override bench.config.json):
   --region <region>        AWS region.
   --part-size <size>       Multipart part size (default 64MiB).
   --checksum <algo>        Per-part checksum (CRC32C/CRC32/SHA256/SHA1).
-  --source <mode>          Upload data source: memory | file | stream. Default: memory.
-                           memory = upload from a pre-built in-memory buffer
-                                    (buffer creation is excluded from timing)
-                           file   = read each part from a local file (measures
-                                    disk read + upload); a temp file is created
-                                    up front, untimed, and removed afterward.
-                           stream = customer hands one Readable per object to main;
-                                    main carves+fills parts and transfers them (zero
-                                    copy) to a pool of uploader threads that
-                                    UploadPart in parallel, out of order.
-                           open   = customer passes a re-openable source descriptor
-                                    (factory); each worker opens its OWN stream for
-                                    its part range (distributes ingress across cores).
-                           open-stream = carver threads open whole-object streams and
-                                    carve parts; a separate uploader pool uploads them.
-  --open-type <type>       ('open'/'open-stream' opener) file | memory. memory =
-                           generate bytes in-memory (no disk), fastest ingress.
-  --carvers <n>            (open-stream) number of carver threads (0 = one per object).
-  --source-path <dir>      Directory for the 'file'/'open' source temp file.
-  --max-buffered <size>    (stream) cap on carved-but-unsent parts held on main
-                           (dispatch queue). 0 = auto ((workers*concurrency+1) parts).
+  --delivery <mode>        Upload delivery mode (S3TransferManager API): memory | file |
+                           stream. Default: memory.
+                           memory = pre-filled buffers per object (pure ceiling; untimed
+                                    fill; needs sum(object sizes) RAM, preflight-guarded).
+                                    Use --memory-input to pick the buffer shape.
+                           file   = a source file per object; each WORKER positionally
+                                    reads its own part ranges (distributed; disk read in
+                                    the timed window).
+                           stream = a synthetic customer Readable per object from main;
+                                    main carves it (ingress memcpy in the window).
+  --memory-input <type>    (memory) parts | sab. Default: parts.
+                           parts = part-sized buffers transferred (zero-copy) to workers.
+                           sab   = one SharedArrayBuffer per object; workers read slices.
+  --source-path <dir>      Directory for the 'file' source temp file.
+  --max-buffered <size>    (file/stream) cap on the carve buffer pool (carved-but-unsent
+                           parts held on main). 0 = auto ((workers*concurrency+1) parts).
   --client-rate <size>     (stream) throttle the simulated customer stream to size
                            bytes/sec per object. 0 = as fast as possible.
   --client-chunk <size>    (stream) chunk size the simulated customer stream pushes.
@@ -552,36 +547,25 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
   const prefix = args.prefix ?? pick('dataPrefix') ?? '';
   const groups = sizeGroups(prefix, rawSizes);
 
-  // memory - allocate ONE object-sized SharedArrayBuffer per object up front
-  //          (untimed), random-filled once and shared across the whole worker pool.
-  //          Every part is a zero-copy view into its object's buffer. RESIDENT
-  //          memory = sum of all object sizes, so it only fits when that sum is
-  //          under box RAM (preflight-guarded). Models a customer who already has
-  //          whole objects in memory and hands them to the transfer manager.
-  // file   - read each part from a shared source file on demand (blocking readSync)
-  // stream - the customer hands ONE Readable per object to the main thread; main
-  //          reads it, carves + fills part buffers (single-thread ingress), and
-  //          TRANSFERS each part (zero-copy) to a pool of uploader worker threads
-  //          that UploadPart in parallel, out of order. Models a Transfer-Manager
-  //          style API where the customer only ever touches the main thread.
-  // open   - the customer passes a re-openable source DESCRIPTOR (factory pattern),
-  //          not a live stream; each worker OPENS ITS OWN stream for its part's byte
-  //          range and uploads it. Distributes ingress across worker threads (no
-  //          single-thread main funnel). Needs a range-addressable source.
-  // open-stream - two tiers: CARVER worker threads each open a whole-object stream
-  //          (via the opener callback, one object per stream) and carve parts; a
-  //          separate UPLOADER worker pool does the UploadParts. Parts flow
-  //          carver -> main -> uploader by zero-copy transfer, with credit-based
-  //          backpressure. The opener returns one Readable per object (no ranges).
-  const uploadSource = args.source ?? pick('uploadSource') ?? 'memory';
-  if (!['memory', 'file', 'stream', 'open', 'open-stream'].includes(uploadSource)) {
-    throw new Error(`Invalid uploadSource "${uploadSource}". Use memory | file | stream | open | open-stream.`);
+  // Upload always runs through the S3TransferManager API. deliveryMode selects where
+  // each object's bytes come from:
+  //   memory - PRE-FILLED buffers per object (built untimed); measures the pure
+  //            network/CPU upload ceiling. Needs sum(object sizes) RAM (guarded).
+  //            memoryInputType picks the buffer shape:
+  //              parts - part-sized standalone Buffers, TRANSFERRED (zero-copy) to
+  //                      workers, then back so they're reusable.
+  //              sab   - one SharedArrayBuffer per object; workers read zero-copy SLICES.
+  //   file   - a source file per object; each WORKER positionally reads its own part
+  //            ranges (distributed ingress; disk read inside the measured window).
+  //   stream - a synthetic customer Readable per object (from main); main carves it
+  //            (ingress memcpy inside the window). Models a streaming customer.
+  const deliveryMode = args.delivery ?? pick('deliveryMode') ?? 'memory';
+  if (!['memory', 'file', 'stream'].includes(deliveryMode)) {
+    throw new Error(`Invalid upload deliveryMode "${deliveryMode}". Use memory | file | stream.`);
   }
-
-  // Built-in opener type for 'open' / 'open-stream' (fixed params, no custom module).
-  const uploadOpenType = args['open-type'] ?? pick('uploadOpen')?.type ?? 'file';
-  if ((uploadSource === 'open' || uploadSource === 'open-stream') && !['file', 'memory'].includes(uploadOpenType)) {
-    throw new Error(`Invalid open type "${uploadOpenType}". Use file | memory.`);
+  const memoryInputType = args['memory-input'] ?? pick('memoryInputType') ?? 'parts';
+  if (deliveryMode === 'memory' && !['parts', 'sab'].includes(memoryInputType)) {
+    throw new Error(`Invalid memoryInputType "${memoryInputType}". Use parts | sab.`);
   }
 
   return {
@@ -591,25 +575,11 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     groups,
     partSize: parseSize(args['part-size'] ?? pick('partSize') ?? '64MiB'),
     checksum: (args.checksum ?? pick('checksum') ?? 'CRC32C').toUpperCase(),
-    uploadSource,
-    // Route the upload through the S3TransferManager API (persistent warm uploader
-    // pool constructed once; each iteration calls upload() per object concurrently,
-    // each fed a customer Readable from MAIN which the manager carves + fans out).
-    // DEFAULT path; the measured window is the full CreateMPU -> UploadPart ->
-    // CompleteMPU. api:false / --no-api falls back to the legacy uploadSource loop.
-    api: args['no-api'] ? false : (pick('api') ?? true),
-    // 'open' / 'open-stream' source: which built-in opener each worker uses.
-    //   file   - read from the shared source file ('open' = byte ranges,
-    //            'open-stream' = whole object)
-    //   memory - generate bytes in-memory (no disk), fastest ingress
-    uploadOpen: { type: uploadOpenType },
-    // open-stream: number of carver threads (each opens whole-object streams and
-    // carves parts for the uploader pool). 0 = auto (one per object, capped at that).
-    uploadCarvers: Number(args.carvers ?? pick('uploadCarvers') ?? 0),
-    // stream source: cap (bytes) on carved-but-not-yet-uploaded parts held on main
-    // (the dispatch queue). Bounds memory + gives the uploader pool a surplus to
-    // pull from; when full, main pauses reading the customer stream (backpressure).
-    // 0 = auto ((workers x concurrency + 1) parts).
+    deliveryMode,
+    memoryInputType,
+    // file/stream sources: cap (bytes) on the carve buffer pool (carved-but-unsent
+    // parts held on main). Bounds memory + gives the uploader pool a surplus; when
+    // full, carving pauses (backpressure). 0 = auto ((workers x concurrency + 1) parts).
     uploadMaxBuffered: (args['max-buffered'] ?? pick('uploadMaxBuffered')) != null
       ? parseSize(args['max-buffered'] ?? pick('uploadMaxBuffered'))
       : 0,
@@ -618,9 +588,7 @@ export function parseUploadArgs(argv = process.argv.slice(2)) {
     uploadClientRate: (args['client-rate'] ?? pick('uploadClientRate')) != null
       ? parseSize(args['client-rate'] ?? pick('uploadClientRate'))
       : 0,
-    // stream source: chunk size the simulated customer stream pushes (models how a
-    // client sends). Smaller = more realistic but more per-part event-loop churn on
-    // the single-threaded ingress; larger = less overhead. Default 1MiB.
+    // stream source: chunk size the simulated customer stream pushes. Default 1MiB.
     uploadClientChunk: (args['client-chunk'] ?? pick('uploadClientChunk')) != null
       ? parseSize(args['client-chunk'] ?? pick('uploadClientChunk'))
       : 1 << 20,

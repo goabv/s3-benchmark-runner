@@ -184,13 +184,11 @@ A representative config (this repo's current one):
 | `iterations` | `1` | Measured upload runs per size. |
 | `warmup` | `1` | Unmeasured priming run. |
 | `forceUpload` | `false` | If `true`, upload even when a matching object already exists; otherwise skip objects whose size **and** part size already match. |
-| `api` | `true` (default) | Route the upload through the `S3TransferManager` API — **the default and recommended path**. The uploader pool is constructed **once** (spawn + client init = one-time, reported separately); each iteration fires **x concurrent `upload()` calls** (one per object), each fed a customer `Readable` from **main** (a synthetic stream here). The manager carves each stream into parts and fans them out to the pool, running the full `CreateMPU → UploadPart → CompleteMPU` per object. `uploadSource` is ignored on this path. Set `api:false` / `--no-api` for the legacy `uploadSource` loop. |
-| `uploadSource` | `memory` | Where part bytes come from: `memory` (one object-sized `SharedArrayBuffer` per object, filled once; parts are zero-copy views — resident memory = sum of object sizes, preflight-guarded), `file` (read each part from disk inline — measures disk + upload), `stream` (the customer hands one `Readable` per object to main; main carves + transfers parts to a pool of uploader threads), `open` (the customer passes a re-openable source descriptor; each worker opens its own stream for its part range — distributes ingress across cores), or `open-stream` (carver threads open whole-object streams, a separate uploader pool sends). See the Data source section below. |
-| `uploadOpen` | `{ "type": "file" }` | **open / open-stream only.** The source descriptor: `{ "type": "file" }` (read the shared source file), `{ "type": "memory" }` (generate bytes in-memory on each worker — no disk, fastest ingress). Fixed built-in openers only. |
-| `uploadCarvers` | `0` (auto) | **open-stream only.** Number of carver threads. `0` = one per object; set lower to put multiple objects on each carver (they're carved sequentially). Carvers + uploaders (`workers`) are separate pools, so total threads ≈ `carvers + workers`. |
-| `uploadMaxBuffered` | `0` (auto) | **stream source only.** Cap (bytes) on carved-but-not-yet-uploaded parts held on main (the dispatch queue). Bounds memory and gives the uploader pool a surplus to pull from; when full, main pauses reading the customer stream (backpressure). `0` = auto (`workers × concurrency + 1` parts). |
-| `uploadClientRate` | `0` | **stream source only.** Throttle the simulated customer stream to this many bytes/sec per object (models client send rate). `0` = as fast as possible. |
-| `uploadClientChunk` | `1MiB` | **stream source only.** Chunk size the simulated customer stream pushes. Smaller = more realistic client behavior but more per-part event-loop churn on the single-threaded main ingress; larger reduces that overhead. Useful for measuring how much of the ingress ceiling is stream machinery vs. the raw per-byte memcpy. |
+| `deliveryMode` | `memory` | Where each object's bytes come from (all through the `S3TransferManager` API — the only upload path). `memory`: pre-filled buffers per object (filled **untimed**; pure network/CPU ceiling; needs `sum(object sizes)` RAM, preflight-guarded) — use `memoryInputType` for the shape. `file`: a source file per object, each **worker positionally reads its own part ranges** (distributed ingress; disk read inside the timed window). `stream`: a synthetic customer `Readable` per object from main, carved on main (ingress memcpy inside the window). See [Upload sources](#upload-sources). |
+| `memoryInputType` | `parts` | **memory only.** `parts`: part-sized standalone Buffers per object, **transferred** (zero-copy ownership) to workers then back (reusable). `sab`: one `SharedArrayBuffer` per object, workers read **zero-copy slices** (shared). |
+| `uploadMaxBuffered` | `0` (auto) | **file / stream only.** Cap (bytes) on the in-flight part buffer pool. `0` = auto (`workers × concurrency + 1` parts). `memory` mode doesn't use it. |
+| `uploadClientRate` | `0` | **stream only.** Throttle the simulated customer stream to this many bytes/sec per object (models client send rate). `0` = as fast as possible. |
+| `uploadClientChunk` | `1MiB` | **stream only.** Chunk size the simulated customer stream pushes. Smaller = more realistic client behavior but more per-part event-loop churn on the single-threaded main ingress; larger reduces that overhead. |
 | `spreadConnections` | `false` | Same DNS-spreading as download, per-direction. |
 | `ipThroughputSizes` | `[]` | Per-IP throughput recording for upload, gated by size label. |
 
@@ -314,63 +312,45 @@ lifecycle: `CreateMultipartUpload` → parallel `UploadPart` → `CompleteMultip
 so the reported throughput is **end-to-end** for the upload (create + all parts +
 complete), not just the part transfer.
 
-**Data source** — set `uploadSource` in the `upload` section:
+### Upload sources
+
+Upload always runs through the `S3TransferManager` API (construct pool once → x
+concurrent `upload()` calls → parallel `UploadPart` → `CompleteMPU`). `deliveryMode`
+selects where each object's bytes come from (and `memoryInputType` the memory variant):
 
 ```json
-"upload": { "uploadSource": "memory" }   // or "file" | "stream" | "open" | "open-stream"
+"upload": { "deliveryMode": "memory", "memoryInputType": "parts" }   // memory: parts | sab; or "file" | "stream"
 ```
 
-| `uploadSource` | What it does | Measures |
+| `deliveryMode` | What it does | Measures |
 |--------|--------------|----------|
-| `memory` (default) | Allocate one **object-sized `SharedArrayBuffer` per object** up front (untimed), random-filled once and shared across the whole worker pool. Every part is a **zero-copy view** into its object's buffer | Pure network + CPU (checksum) upload cost. **Resident memory = sum of all object sizes**, so it only fits when that sum is under box RAM (preflight-guarded; fails fast otherwise) |
-| `file` | Read each part from a local file during upload, inline with the send loop (a blocking `readSync`, so the worker's event loop stalls during each read) | Disk read + upload, serialized |
-| `stream` | The customer hands one `Readable` per object to **main**; main reads it, carves + fills part buffers, and **transfers** each part (zero-copy) to a pool of **uploader worker threads** that `UploadPart` in parallel, out of order | Transfer-Manager-style streaming upload: single-thread ingress + fanned-out parallel upload |
-| `open` | The customer passes a re-openable source **descriptor** (factory pattern), not a live stream; **each worker opens its own stream** for its part's byte range and uploads it | Distributed ingress — reading is fanned across worker threads (no single-thread main funnel), for range-addressable sources |
-| `open-stream` | Two tiers: **carver** threads each open a *whole-object* stream (via the opener callback, one object per stream) and carve parts; a separate **uploader** pool does the `UploadPart`s. Parts flow carver → main → uploader by zero-copy transfer, with credit-based backpressure | Carving (ingress) and uploading run on separate thread pools; ingress parallelizes across objects without needing a range-addressable source |
+| `memory` + `parts` (default) | Caller pre-fills (untimed) a **collection of part-sized standalone `Buffer`s per object**; each is **transferred** (zero-copy ownership) to a worker for `UploadPart`, then transferred back so the array is reusable across iterations | Pure network + CPU (checksum) ceiling, no in-window fill. **Resident memory = sum of object sizes** (preflight-guarded) |
+| `memory` + `sab` | Caller pre-fills (untimed) one **object-sized `SharedArrayBuffer` per object**; workers read **zero-copy slices** (shared, not transferred) | Same pure ceiling, shared-memory variant. **Resident = sum of object sizes** |
+| `file` | A source file per object (written untimed); **each worker positionally reads its own part ranges** from the file (`readSync` at offset) and uploads — distributed ingress, no main funnel | Disk read + upload; disk read is inside the timed window. Memory bounded by `uploadMaxBuffered` |
+| `stream` | A synthetic customer `Readable` per object (from main); main **carves** it into pooled buffers, transferred to workers | Streaming ingress: single-thread carve/memcpy on main (inside the window) + parallel upload. Memory bounded by `uploadMaxBuffered` |
 
-**Stream source (`stream`) — a Transfer-Manager-style API where the customer only touches the main thread.** The customer hands one `Readable` per object to main; internally we fan the upload across worker threads without the customer ever seeing them:
+**parts / sab — pre-filled, pure ceiling.** The bytes are materialized untimed, so the
+measured window is only `CreateMPU → UploadPart → CompleteMPU` with no ingress cost.
+`parts` uses transferable per-part `Buffer`s (exclusive ownership, ping-ponged back for
+reuse); `sab` uses one shared buffer per object (workers read slices in place). Both
+need `sum(object sizes)` RAM, so size the workload to fit (preflight-guarded, fails
+fast otherwise).
 
-- **Main carves.** A producer per object reads the (here, synthetic) customer stream, copies each part's bytes into a recycled buffer (the ingress fill — bytes flow through main as a client would send them), numbers it, and enqueues it. A `Readable` can't cross the worker boundary, so this ingress is necessarily single-threaded on main.
-- **Fan-out to an uploader pool.** Main transfers each carved part (zero-copy `postMessage`) to an idle lane across the uploader worker pool; any worker uploads any object's parts, out of order (S3 assembles by `PartNumber`). Workers transfer the freed buffer back for reuse (return-credit).
-- **Backpressure.** A bounded pool of recycled buffers (cap = `uploadMaxBuffered`) gates everything: when main can't get a free buffer it stops reading the customer stream, which throttles the client. Bounded memory end-to-end.
-- **`CompleteMultipartUpload`** per object once its stream ends and all its parts are acked.
-- Optional `uploadClientRate` throttles the simulated client's send rate.
+**file — distributed worker reads.** Main only plans the part byte-ranges; **each
+worker positionally reads its own parts** from the source file (`readSync` at offset,
+per-file fd cache) and uploads them. Disk ingress fans across all workers (no main
+funnel), and the round-robin dispatch spreads each worker's reads across many files.
+Memory is bounded by the in-flight part pool (`uploadMaxBuffered`), not object size.
+The disk read is inside the measured window.
 
-Honest ceiling: the ingress (read + fill) is single-threaded on main (~one core's memcpy), so a *single* stream is capped there regardless of how many uploader workers there are — you can hide the fan-out behind main, but not beat single-thread ingress for one stream. Parallelism comes from multiple concurrent object streams. Each part is still sent as a materialized `Buffer` (header checksum, same wire format as `memory`/`file`).
+**stream — main-thread carve.** A customer `Readable` can't cross the worker boundary,
+so main reads it and carves it into part-sized buffers (single-threaded ingress memcpy),
+then transfers each to the uploader pool. Bounded by a recycled buffer pool
+(`uploadMaxBuffered`) that backpressures the source when empty. `uploadClientRate`
+throttles the simulated client; `uploadClientChunk` sets the push chunk size. This
+measures streaming ingress **including** the main-thread carve, unlike `memory`.
 
-**Open source (`open`) — the factory pattern that distributes ingress.** The `stream` ceiling exists because a live `Readable` can't cross the worker boundary, so main is the sole ingress thread. The `open` source removes that limit: instead of a live stream, the customer passes a **re-openable descriptor** (data, not a closure), and **each worker opens its own stream** for its assigned part ranges — so reading is fanned across worker threads, no main funnel.
-
-```json
-"upload": { "uploadSource": "open", "uploadOpen": { "type": "file" } }
-```
-
-- **file opener** (`{ "type": "file" }`, the default): a shared source file is written up front (untimed), and each worker opens `fs.createReadStream(path, { start, end })` for each of its parts' byte ranges, drains it, and uploads. Because a file is range-addressable, one object's ingress spans all workers.
-- **memory opener** (`{ "type": "memory" }`, or `--open-type memory`): each worker generates its part's bytes in-memory (no disk) from a reused template — fastest ingress.
-
-(These are the only two built-in openers — fixed params, no custom callback module for now.)
-
-The requirement is that the source be **re-openable from a reference on the worker's thread** (a path, URL, key + byte range). That's what lets ingress parallelize — unlike a live push stream, which is stuck on main (`stream` mode). Use `open` to lift the single-thread ingress ceiling when the source is seekable; use `stream` when the customer genuinely hands you one live stream.
-
-**Open-stream source (`open-stream`) — two tiers: carvers + uploaders.** Where `open` opens a *ranged* read per part (needs a seekable source), `open-stream` handles a source that's only *sequential per object*: **carver** threads each open one whole-object `Readable` (the built-in `file` or `memory` opener), read it front-to-back, and carve part buffers; a separate **uploader** pool does the `UploadPart`s.
-
-```json
-"upload": { "uploadSource": "open-stream", "uploadCarvers": 4, "uploadOpen": { "type": "memory" } }
-```
-
-- Parts flow **carver → main → uploader** by zero-copy transfer; main brokers and, when a part finishes uploading, transfers the freed buffer **back to its carver** with an `ack`. That ack is also a **credit**: a carver never has more than `uploadMaxBuffered / carvers` parts outstanding, so it pauses reading its stream when the uploader pool falls behind (end-to-end backpressure, bounded memory).
-- **Carving and uploading are separate thread pools**, so per-object sequential ingress (carving) doesn't block the parallel `UploadPart`s. Ingress parallelizes **across objects** (one carver per object by default).
-- `uploadCarvers` consolidates objects onto fewer carver threads (each carves its objects sequentially), so you don't spawn a thread per object when you have many. Total threads ≈ `carvers + workers`.
-
-This is the model for "the customer hands us a stream we can re-open per object but not range-address" — e.g. a per-object generator or a non-seekable-but-reopenable source. A genuinely live single push stream still belongs in `stream` mode (main-carve).
-
-- **memory**: the random buffer is allocated + filled once per worker before the
-  worker signals ready, so buffer-creation time is excluded from the measured
-  window. Memory ≈ `workers × partSize`.
-- **file**: a random source file of the object size is written to `sourcePath`
-  (default OS temp) before timing (reported as `[setup] ...`), then each part is
-  read from disk during the timed upload and the file is deleted afterward. Point
-  `sourcePath` at a fast disk so storage doesn't cap the result.
-- Parts are uploaded with the configured `checksum` algorithm, so the completed
+Parts are uploaded with the configured `checksum` algorithm, so the completed
   object has per-part checksums and doubles as **seed data** for the download
   benchmark.
 - By default it **skips** a size whose object already exists at the matching total
@@ -506,14 +486,15 @@ streams; `deliveryMode` selects only the **destination** the harness drains each
 slow reader can be modeled with `consumerRate`). Set `api:false` / `--no-api` to use the
 legacy `deliveryMode` run loop instead.
 
-**Uploads use the same manager.** `upload({ bucket, key, body })` takes a customer
-`Readable` from main; the manager runs `CreateMPU`, carves the stream into `partSize`
-buffers on main (single-thread ingress + memcpy — a `Readable` can't cross the worker
-boundary), transfers each part zero-copy to a warm uploader pool that does parallel
-`UploadPart`, then `CompleteMPU`. `uploadMany({ sources })` runs many through one pool +
-one `uploadMaxBuffered` budget. The upload benchmark uses this by default (`upload.api`),
-firing x concurrent `upload()` calls fed by synthetic customer streams; window =
-`CreateMPU → CompleteMPU`, pool spawn one-time.
+**Uploads use the same manager** (`mode: 'upload'`). `upload({ bucket, key, ... })`
+runs `CreateMPU → parallel UploadPart → CompleteMPU` from one of four per-object
+sources: `parts` (pre-filled part-sized Buffers, transferred to workers), `buffer`+`size`
+(a pre-filled `SharedArrayBuffer`, workers read zero-copy slices), `file` (a path — main
+opens a read stream and carves it), or `body` (a customer `Readable` from main — main
+carves it; a `Readable` can't cross the worker boundary, so the carve/memcpy is
+single-threaded on main). `uploadMany({ sources })` runs many through one pool. The
+upload benchmark is API-only (`deliveryMode` picks the source); window = `CreateMPU →
+CompleteMPU`, pool spawn one-time. See [Upload sources](#upload-sources).
 
 ```js
 const tm = new S3TransferManager(cfg);      // spawns the worker pool ONCE (one-time cost)
@@ -1048,14 +1029,12 @@ Shares the tuning flags above (`--workers`, `--concurrency`, `--iterations`,
 | `--sizes <s1,s2>` | `sizes` | Sizes to upload (each optionally `<size>:<count>`) |
 | `--part-size <size>` | `partSize` | Multipart part size |
 | `--checksum <algo>` | `checksum` | `CRC32` \| `CRC32C` \| `SHA256` \| `SHA1` |
-| `--source <mode>` | `uploadSource` | `memory` \| `file` \| `stream` \| `open` \| `open-stream` |
-| `--open-type <type>` | `uploadOpen.type` | `open`/`open-stream` opener: `file` \| `memory` (in-memory, no disk) |
-| `--carvers <n>` | `uploadCarvers` | open-stream: carver thread count (0 = one per object) |
-| `--max-buffered <size>` | `uploadMaxBuffered` | stream source: main-side dispatch queue cap (0 = auto) |
-| `--client-rate <size>` | `uploadClientRate` | stream source: throttle simulated client bytes/sec (0 = unlimited) |
-| `--client-chunk <size>` | `uploadClientChunk` | stream source: simulated client push chunk size (default 1MiB) |
+| `--delivery <mode>` | `deliveryMode` | `memory` \| `file` \| `stream` |
+| `--memory-input <type>` | `memoryInputType` | memory: `parts` \| `sab` |
+| `--max-buffered <size>` | `uploadMaxBuffered` | file/stream: in-flight part pool cap (0 = auto) |
+| `--client-rate <size>` | `uploadClientRate` | stream: throttle simulated client bytes/sec (0 = unlimited) |
+| `--client-chunk <size>` | `uploadClientChunk` | stream: simulated client push chunk size (default 1MiB) |
 | `--source-path <dir>` | `sourcePath` | Dir for the `file` source temp file |
-| `--no-api` | `api:false` | Disable the default `S3TransferManager` upload API; use the legacy `uploadSource` loop |
 | `--force` | `forceUpload` | Upload even if a matching object exists |
 
 ### Seed (`src/upload-test-data.js`)

@@ -3,7 +3,7 @@
   "region": "us-west-2",
   "dataPrefix": "bench/",
   "codePrefix": "code/",
-  "sizes": [{ "size": "30GiB", "count": 10 }],
+  "sizes": [{ "size": "20GiB", "count": 3 }],
   "partSize": "32MiB",
   "checksum": "CRC32",
 
@@ -36,12 +36,12 @@
   "upload": {
     "workers": 60,
     "concurrency": 6,
-    "carvers": 4,
     "iterations": 1,
     "warmup": 0,
     "httpHandler": "node",
     "forceUpload": false,
-    "uploadSource": "memory",
+    "deliveryMode": "memory",
+    "memoryInputType": "parts",
     "spreadConnections": true,
     "ipThroughputSizes": []
   }
