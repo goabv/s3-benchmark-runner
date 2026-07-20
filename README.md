@@ -479,12 +479,16 @@ the `download` section:
 By default (`download.api: true`) the benchmark runs through a Transfer-Manager-shaped
 wrapper, `S3TransferManager` (the same class serves uploads via `upload()`/`uploadMany()`
 — see below). This makes the measurement boundary match a real transfer manager's public
-API: construct once, then call `download()` per object. It always delivers to per-object
-streams; `deliveryMode` selects only the **destination** the harness drains each stream to:
-`file` pipes the ordered stream to a local file (download-to-disk), and anything else
-(`discard`/`ordered-drop`/`ordered-stream`) drains to a discard sink (pure throughput; a
-slow reader can be modeled with `consumerRate`). Set `api:false` / `--no-api` to use the
-legacy `deliveryMode` run loop instead.
+API: construct once, then call `download()` per object. `deliveryMode` picks the shape:
+- **`file`** — `download({ bucket, key, file })` returns a promise (no stream). Each
+  **worker positionally writes its own parts** to the pre-sized output file at their byte
+  offsets (`writevSync` at `part.offset`) — distributed, out of order, **no reorder buffer
+  and no main funnel**. Fastest download-to-disk path.
+- **anything else** (`discard`/`ordered-drop`/`ordered-stream`) — `download({ bucket, key })`
+  returns an ordered `Readable` (`body`); the harness drains it to a discard sink (pure
+  throughput; a slow reader can be modeled with `consumerRate`).
+
+Set `api:false` / `--no-api` to use the legacy `deliveryMode` run loop instead.
 
 **Uploads use the same manager** (`mode: 'upload'`). `upload({ bucket, key, ... })`
 runs `CreateMPU → parallel UploadPart → CompleteMPU` from one of four per-object

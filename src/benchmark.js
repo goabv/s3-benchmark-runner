@@ -2,7 +2,7 @@
 import { Worker } from 'node:worker_threads';
 import { Readable, Writable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { writeFileSync, mkdirSync, openSync, ftruncateSync, closeSync, rmSync, createWriteStream } from 'node:fs';
+import { writeFileSync, mkdirSync, openSync, ftruncateSync, closeSync, rmSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
@@ -648,32 +648,25 @@ function writeTimeseries(cfg, label, tsByIter) {
  */
 async function runViaManager(manager, cfg, group, reporter, filePaths) {
   manager.resetScheduler();
-  const hwm = cfg.streamHwm > 0 ? cfg.streamHwm : 2 * (1 << 20);
-  const toFile = cfg.deliveryMode === 'file' && filePaths;
   const t0 = performance.now();
   reporter?.start();
-  // x concurrent download() calls (one per object) sharing the one pool + budget.
-  const handles = await Promise.all(group.keys.map((key) => manager.download({ bucket: cfg.bucket, key })));
-  let bytes = 0;
-  await Promise.all(
-    handles.map(
-      ({ key, body }) =>
-        new Promise((resolve, reject) => {
-          if (toFile) {
-            // Download-to-disk: pipe the in-order stream to the per-object file. No
-            // buffer recycling (the write stream owns each chunk until it's flushed).
-            const ws = createWriteStream(filePaths[key]);
-            ws.on('error', reject);
-            ws.on('finish', resolve);
-            body.on('error', reject);
-            body.on('data', (c) => (bytes += c.length));
-            body.pipe(ws);
-          } else {
-            // Discard (optionally throttled) sink; recycle each buffer after use.
+  if (cfg.deliveryMode === 'file' && filePaths) {
+    // Distributed file writes: each worker downloads its own parts and positionally
+    // writes them to the pre-sized output file (no stream, no main funnel). We just
+    // fire x concurrent download({file}) calls and await completion.
+    await Promise.all(group.keys.map((key) => manager.download({ bucket: cfg.bucket, key, file: filePaths[key] })));
+  } else {
+    // Stream: x concurrent download() calls -> per-object ordered Readables, drained
+    // concurrently into a discard (optionally throttled) sink; recycle buffers.
+    const hwm = cfg.streamHwm > 0 ? cfg.streamHwm : 2 * (1 << 20);
+    const handles = await Promise.all(group.keys.map((key) => manager.download({ bucket: cfg.bucket, key })));
+    await Promise.all(
+      handles.map(
+        ({ body }) =>
+          new Promise((resolve, reject) => {
             const sink = new Writable({
               highWaterMark: hwm,
               write(chunk, _enc, cb) {
-                bytes += chunk.length;
                 const done = () => {
                   manager.recycle(chunk); // return the buffer to its worker (bufferReturn)
                   cb();
@@ -686,14 +679,20 @@ async function runViaManager(manager, cfg, group, reporter, filePaths) {
             sink.on('error', reject);
             sink.on('finish', resolve);
             body.pipe(sink);
-          }
-        }),
-    ),
-  );
+          }),
+      ),
+    );
+  }
   const wallMs = performance.now() - t0;
   reporter?.stop();
-  // deliveredChecksummed/deliveredCount reflect THIS run (resetScheduler zeroed them).
-  return { bytes, wallMs, checksummed: manager.deliveredChecksummed, partsDone: manager.deliveredCount };
+  // deliveredBytes/Count/Checksummed reflect THIS run (resetScheduler zeroed them),
+  // for both file (part-written) and stream (drainKey) paths.
+  return {
+    bytes: manager.deliveredBytes,
+    wallMs,
+    checksummed: manager.deliveredChecksummed,
+    partsDone: manager.deliveredCount,
+  };
 }
 
 async function benchmarkGroup(cfg, group) {
@@ -817,6 +816,8 @@ async function benchmarkGroup(cfg, group) {
         region: cfg.region,
         workers: Math.min(cfg.workers, parts.length),
         concurrency: cfg.concurrency,
+        deliveryMode: cfg.deliveryMode, // 'file' spawns file-writing workers
+        deliveryPath: cfg.deliveryPath,
         maxBufferedBytes: cfg.maxBufferedBytes,
         streamHwm: cfg.streamHwm,
         bufferReturn: cfg.bufferReturn,
@@ -994,9 +995,12 @@ function printHuman(cfg, all) {
   console.log(
     `download unit=PartNumber  handler=${cfg.httpHandler}  transport=${tlsNote}  ` +
       (all.some((r) => r.api)
-        ? `api=S3TransferManager (x concurrent download() + concurrent drain)  ` +
-          `delivery=stream (per-object Readable, max-buffered ${formatBytes(cfg.maxBufferedBytes)}` +
-          `${cfg.consumerRate > 0 ? `, consumer ${formatBytes(cfg.consumerRate)}/s` : ''})  `
+        ? `api=S3TransferManager  ` +
+          (cfg.deliveryMode === 'file'
+            ? `delivery=file (distributed worker writes at offsets -> ${cfg.deliveryPath})  `
+            : `delivery=stream (x concurrent download() + concurrent drain, per-object Readable, ` +
+              `max-buffered ${formatBytes(cfg.maxBufferedBytes)}` +
+              `${cfg.consumerRate > 0 ? `, consumer ${formatBytes(cfg.consumerRate)}/s` : ''})  `)
         : `delivery=${cfg.deliveryMode}${
             cfg.deliveryMode === 'ordered-stream'
               ? ` (max-buffered ${formatBytes(cfg.maxBufferedBytes)}, transfer${cfg.bufferReturn ? '+return' : ''}${cfg.consumerRate > 0 ? `, consumer ${formatBytes(cfg.consumerRate)}/s` : ''})`

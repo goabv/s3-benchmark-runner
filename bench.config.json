@@ -16,6 +16,7 @@
     "validateChecksum": true,
     "nativeCrc32": true,
     "deliveryMode": "ordered-stream",
+    "deliveryPath":"/home/ec2-user/fileoutput",
     "maxBufferedBytes": "48GiB",
     "bufferPool": true,
     "consumerRate": "0",

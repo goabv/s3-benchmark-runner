@@ -291,13 +291,25 @@ async function downloadPart(part) {
 }
 
 function closeFds() {
-  if (!fds) return;
-  for (const fd of fds.values()) {
-    try {
-      closeSync(fd);
-    } catch {
-      /* ignore */
+  if (fds) {
+    for (const fd of fds.values()) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
     }
+  }
+  // Path-keyed fds from file (dispatch) mode.
+  if (typeof pathFds !== 'undefined' && pathFds) {
+    for (const fd of pathFds.values()) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+    pathFds.clear();
   }
 }
 
@@ -363,6 +375,17 @@ function releaseBuf(buf) {
 // ArrayBuffers back here, so a bounded set of buffers ping-pongs across the
 // thread boundary instead of allocating one per part.
 const streamMode = deliveryMode === 'ordered-stream';
+const fileMode = deliveryMode === 'file';
+// file (dispatch) mode: cache one fd per output path (positional writes at offsets).
+const pathFds = new Map();
+function fdForPath(p) {
+  let fd = pathFds.get(p);
+  if (fd === undefined) {
+    fd = openSync(p, 'r+');
+    pathFds.set(p, fd);
+  }
+  return fd;
+}
 const returnedBufs = []; // ArrayBuffers handed back by main, available for reuse
 function acquireArrayBuffer(size) {
   if (bufferReturn) {
@@ -401,7 +424,7 @@ async function dispatchMaybeDone() {
   }
 }
 
-if (deliveryMode === 'ordered-stream' || deliveryMode === 'ordered-drop') {
+if (deliveryMode === 'ordered-stream' || deliveryMode === 'ordered-drop' || deliveryMode === 'file') {
   parentPort.on('message', async (msg) => {
     if (msg?.type === 'assign') {
       dispatchInFlight += 1;
@@ -411,6 +434,47 @@ if (deliveryMode === 'ordered-stream' || deliveryMode === 'ordered-drop') {
         let byteLength = 0;
         let vip = null;
         let connId = null;
+
+        if (fileMode) {
+          // Download this part and positionally write it to its output file at
+          // part.offset (distributed write, out of order). Nothing crosses to main.
+          const fd = fdForPath(msg.part.file);
+          const chunks = [];
+          const hasChecksum = await withStallRetry(label, async (signal, bump) => {
+            const got = await getPart(msg.part, signal);
+            vip = got.vip;
+            connId = got.connId;
+            byteLength = 0;
+            chunks.length = 0;
+            for await (const chunk of got.body) {
+              chunks.push(chunk);
+              byteLength += chunk.length;
+              bump();
+            }
+            return got.hasChecksum;
+          });
+          // Async positional write on the libuv threadpool: do NOT block the worker's
+          // event loop (a blocking writevSync starves in-flight socket reads + the
+          // stall watchdog, which hangs the last straggler parts on a slow disk).
+          if (chunks.length) await writevAsync(fd, chunks, msg.part.offset);
+          const downloadMs = performance.now() - t0;
+          dPartsDone += 1;
+          if (hasChecksum) dChecksummed += 1;
+          dispatchInFlight -= 1;
+          bumpProgress(progress, byteLength);
+          parentPort.postMessage({
+            type: 'part-written',
+            key: msg.part.key,
+            partNumber: msg.part.partNumber,
+            byteLength,
+            hasChecksum,
+            downloadMs: partTimes ? downloadMs : undefined,
+            vip: partTimes ? vip : undefined,
+            connId: partTimes ? connId : undefined,
+          });
+          dispatchMaybeDone();
+          return;
+        }
 
         if (streamMode) {
           // Assemble the part into a dedicated ArrayBuffer, then TRANSFER it to

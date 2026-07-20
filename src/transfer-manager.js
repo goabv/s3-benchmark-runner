@@ -86,6 +86,9 @@ export class S3TransferManager {
     // — real API callers that keep chunks must leave this off (they just never call
     // recycle(), so nothing is returned and buffers are simply GC'd).
     this.bufferReturn = Boolean(cfg.bufferReturn);
+    // download 'file' mode: workers positionally write their own parts to disk (no
+    // reorder buffer, no main funnel). Anything else = ordered-stream (Readable out).
+    this.downloadFile = cfg.deliveryMode === 'file';
     this.progress = progressView(cfg.progressBuf);
 
     // Pool + scheduler state.
@@ -153,7 +156,7 @@ export class S3TransferManager {
           concurrency: this.concurrency,
           maxSockets,
           validateChecksum: c.validateChecksum,
-          deliveryMode: 'ordered-stream',
+          deliveryMode: this.downloadFile ? 'file' : 'ordered-stream',
           logConnections: c.logConnections,
           spreadConnections: c.spreadConnections,
           tls: c.tls,
@@ -252,6 +255,34 @@ S3TransferManager.prototype._onMessage = function (wi, msg) {
     this.totalInFlight -= 1;
     this._drainKey(msg.key);
     this._dispatchMore();
+  } else if (msg.type === 'part-written') {
+    // file mode: the worker downloaded + positionally wrote this part to disk (no
+    // bytes crossed to main, no reorder). Just account it and complete when done.
+    this.freeLanes[wi] += 1;
+    this.totalInFlight -= 1;
+    this.deliveredBytes += msg.byteLength;
+    this.deliveredCount += 1;
+    if (msg.hasChecksum) this.deliveredChecksummed += 1;
+    if (this.partTimes && msg.downloadMs !== undefined) {
+      this.partTimes.push({
+        key: msg.key,
+        partNumber: msg.partNumber,
+        bytes: msg.byteLength,
+        ms: msg.downloadMs,
+        vip: msg.vip ?? null,
+        connId: msg.connId ?? null,
+      });
+    }
+    const obj = this.objects.get(msg.key);
+    if (obj) {
+      obj.written = (obj.written || 0) + 1;
+      if (obj.written === obj.partsCount && !obj.done) {
+        obj.done = true;
+        this.objects.delete(msg.key);
+        obj.resolve({ key: msg.key, bytes: obj.contentLength });
+      }
+    }
+    this._dispatchMore();
   } else if (msg.type === 'worker-done') {
     if (msg.ipCounts) for (const [ip, c] of msg.ipCounts) this.ipCounts.set(ip, (this.ipCounts.get(ip) || 0) + c);
     if (msg.ipThroughput) for (const [ip, v] of msg.ipThroughput) this.ipThroughput.set(ip, (this.ipThroughput.get(ip) || 0) + v);
@@ -343,11 +374,39 @@ S3TransferManager.prototype.recycle = function (chunk) {
  * MUST drain `body` (its highWaterMark exerts backpressure).
  * @returns {Promise<{ key: string, body: Readable, contentLength: number }>}
  */
-S3TransferManager.prototype.download = async function ({ bucket, key }) {
+S3TransferManager.prototype.download = async function ({ bucket, key, file }) {
   if (this._failed) throw this._failed;
   const b = bucket ?? this.cfg.bucket;
   const info = await describeObject(this.control, b, key);
   const parts = buildParts(key, info.partsCount, info.firstPartSize, info.totalSize);
+
+  // file mode: workers positionally write their own parts to `file` at part.offset
+  // (distributed, out of order, no reorder buffer, no main funnel). Resolves when all
+  // of this object's parts are written. The file must already be sized (caller's job).
+  if (this.downloadFile || file) {
+    const dest = file ?? this.cfg.deliveryPath;
+    for (const p of parts) p.file = dest; // worker reads p.file to know where to write
+    const obj = {
+      key,
+      parts,
+      cursor: 0,
+      partsCount: info.partsCount,
+      contentLength: info.totalSize,
+      written: 0,
+      done: false,
+      resolve: null,
+      reject: null,
+    };
+    const done = new Promise((res, rej) => {
+      obj.resolve = res;
+      obj.reject = rej;
+    });
+    this.objects.set(key, obj);
+    this.active.push(obj);
+    this._dispatchMore();
+    return done;
+  }
+
   const streamHwm =
     this.cfg.streamHwm > 0 ? this.cfg.streamHwm : Math.max(1 << 20, 2 * (parts[0]?.size ?? 1 << 20));
 
