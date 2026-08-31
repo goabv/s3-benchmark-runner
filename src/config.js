@@ -101,7 +101,7 @@ export function isOrderedMode(mode) {
 
 /**
  * Canonical object key for a given size label. Single source of truth shared by
- * the seed script and the benchmark so `--sizes` maps to the same keys on both
+ * the upload and download benchmarks so `--sizes` maps to the same keys on both
  * sides (e.g. "30GiB" + prefix "bench/" -> "bench/30gib.bin").
  */
 export function keyForSize(prefix, sizeLabel, index = 0, count = 1) {
@@ -298,8 +298,9 @@ Options (override bench.config.json):
   --out <file>             Also write JSON results to <file> (works with the table).
   --help                   Show this help.
 
-Note: part count and boundaries come from the object's multipart upload, not a
-flag. Control them at upload time via upload-test-data.js --part-size.
+Note: the download reads each object as fixed-size byte ranges set by "rangeSize"
+in the download section (independent of how the object was uploaded). Run the
+upload benchmark first to create the objects the download reads.
 
 Environment:
   AWS_REGION, AWS_PROFILE and standard AWS credential env vars are respected.
@@ -387,6 +388,11 @@ export function parseArgs(argv = process.argv.slice(2)) {
     // Precedence: --no-checksum (CLI) > "validateChecksum" (section/shared) > true.
     validateChecksum: args['no-checksum'] ? false : (pick('validateChecksum') ?? true),
     deliveryMode,
+    // Download read granularity: fetch each object as fixed-size byte RANGES of this
+    // size, independent of how it was uploaded (its part layout). Config-only — set
+    // "rangeSize" in the download section of bench.config.json. Note arbitrary ranges
+    // carry no per-part checksum, so per-part validation doesn't apply in range mode.
+    rangeSize: parseSize(pick('rangeSize') ?? '16MiB'),
     // Route the run through the S3TransferManager API (persistent warm worker pool
     // constructed once; each iteration calls download() per object concurrently and
     // drains the returned streams concurrently). This is the DEFAULT download path;
@@ -436,6 +442,18 @@ export function parseArgs(argv = process.argv.slice(2)) {
     // file mode: write each part asynchronously (libuv threadpool) so disk-write
     // latency doesn't block the worker's event loop / socket draining.
     fileAsync: Boolean(args['file-async'] || pick('fileAsync')),
+    // download 'file' mode (SIMPLE inline O_DIRECT writer): each download worker
+    // writes the ranges it fetches straight to the destination file at their offset,
+    // preferring O_DIRECT (bypass the page cache) with a buffered fallback for the
+    // final, unaligned range. No separate writer pool, no shared queue — the only
+    // backpressure is the in-flight range count (workers x concurrency).
+    //   fileDirect - use O_DIRECT (opt out with false / --no-file-direct)
+    //   fileChunk  - aligned O_DIRECT pwrite granularity within a range (default 8 MiB)
+    fileDirect: args['no-file-direct'] ? false : (pick('fileDirect') ?? true),
+    fileChunk: parseSize(args['file-chunk'] ?? pick('fileChunk') ?? '8MiB'),
+    // file mode A/B: when true, workers DRAIN each range but DON'T write it to disk
+    // (no fds, no O_DIRECT) — isolates the network + ingest ceiling. Config-only.
+    fileDiscard: Boolean(pick('fileDiscard')),
     // Diagnostics: CPU-profile each download worker and write a .cpuprofile per
     // worker. Default dir is per-node-version so runs under different nodes don't
     // clobber each other. Analyze with scripts/prof-top.mjs.

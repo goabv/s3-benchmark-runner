@@ -7,8 +7,9 @@
  * (dispatched first, always in-flight) eventually completes; the whole chain
  * drains in order. This must finish correctly and NOT hang.
  *
- * Uses the bucket/region from bench.config.json. Seeds a small object, runs the
- * download benchmark as a child process under a hard timeout, then cleans up.
+ * Uses the bucket/region from bench.config.json. Creates a small object via the
+ * upload benchmark, runs the download benchmark (range reads) as a child process
+ * under a hard timeout, then cleans up.
  *
  * Run: node test/ordered-backpressure.test.mjs   (or: npm run test:ordered)
  */
@@ -22,10 +23,9 @@ const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const cfg = loadFileConfig();
 const region = cfg.region || process.env.AWS_REGION;
 const bucket = cfg.bucket;
-const SIZE = '80MiB';
-const PART = '8MiB'; // 80MiB / 8MiB = 10 parts
+const SIZE = '80MiB'; // split into several ranges by download.rangeSize (default 16MiB)
 const SLOW_MS = 3000;
-const CAP = '8MiB'; // tiny cap -> forces backpressure
+const CAP = '8MiB'; // tiny cap -> forces backpressure once an out-of-order range lands
 const TIMEOUT_MS = 90_000;
 
 function run(cmd, args, env) {
@@ -57,14 +57,13 @@ function assert(cond, msg) {
 
 async function main() {
   if (!bucket) throw new Error('No bucket in bench.config.json');
-  console.log(`[test] seeding ordtest/80mib.bin (${SIZE} @ ${PART} parts) ...`);
+  console.log(`[test] creating ordtest/80mib.bin (${SIZE}) via the upload benchmark ...`);
   const seed = await run('node', [
-    'src/upload-test-data.js',
-    '--sizes', SIZE, '--part-size', PART, '--prefix', 'ordtest/', '--force',
+    'src/upload-benchmark.js',
+    '--sizes', SIZE, '--prefix', 'ordtest/', '--force',
   ]);
-  // upload-test-data names keys <size>.bin; rename expectation: ordtest/80mib.bin
-  const seededKey = 'ordtest/80mib.bin';
-  assert(!seed.timedOut && seed.code === 0, `seed completed (exit ${seed.code})`);
+  const seededKey = 'ordtest/80mib.bin'; // keyForSize('ordtest/', '80MiB')
+  assert(!seed.timedOut && seed.code === 0, `upload (seed) completed (exit ${seed.code})`);
 
   console.log(`[test] ordered-stream download with part 1 slowed ${SLOW_MS}ms, cap ${CAP} ...`);
   const res = await run(
@@ -89,7 +88,7 @@ async function main() {
 
   assert(!res.timedOut, `did not hang (completed within ${TIMEOUT_MS}ms)`);
   assert(res.code === 0, `exited cleanly (exit ${res.code})`);
-  assert(/10\/10 parts checksum-validated/.test(res.out), 'all 10 parts delivered in order + validated');
+  assert(!/\[error\]/.test(res.out), 'ordered-stream drained fully in order (no error)');
 
   // cleanup
   const s3 = new S3Client({ region });

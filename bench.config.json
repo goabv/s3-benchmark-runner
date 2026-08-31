@@ -3,8 +3,7 @@
   "region": "us-west-2",
   "dataPrefix": "bench/",
   "codePrefix": "code/",
-  "sizes": [{ "size": "20GiB", "count": 3 }],
-  "partSize": "32MiB",
+  "sizes": [{ "size": "1024GiB", "count": 5 }],
   "checksum": "CRC32",
 
   "download": {
@@ -15,8 +14,12 @@
     "keep": false,
     "validateChecksum": true,
     "nativeCrc32": true,
-    "deliveryMode": "ordered-stream",
-    "deliveryPath":"/home/ec2-user/fileoutput",
+    "rangeSize": "8MiB",
+    "deliveryMode": "file",
+    "deliveryPath":"/mnt/stripe/jsoutput",
+    "fileDirect": true,
+    "fileChunk": "8MiB",
+    "fileDiscard": false,
     "maxBufferedBytes": "48GiB",
     "bufferPool": true,
     "consumerRate": "0",
@@ -39,10 +42,12 @@
     "concurrency": 6,
     "iterations": 1,
     "warmup": 0,
+    "partSize": "128MiB",
     "httpHandler": "node",
     "forceUpload": false,
-    "deliveryMode": "memory",
+    "deliveryMode": "file",
     "memoryInputType": "parts",
+    "sourcePath": "/mnt/stripe/upload-src",
     "spreadConnections": true,
     "ipThroughputSizes": []
   }

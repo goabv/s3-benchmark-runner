@@ -12,7 +12,6 @@
   "scripts": {
     "bench": "node src/benchmark.js",
     "bench:upload": "node src/upload-benchmark.js",
-    "seed": "node src/upload-test-data.js",
     "test:ordered": "node test/ordered-backpressure.test.mjs"
   },
   "dependencies": {

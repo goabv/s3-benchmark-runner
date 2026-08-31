@@ -1,5 +1,16 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { openSync, writevSync, writev as writevCb, closeSync, writeFileSync } from 'node:fs';
+import {
+  openSync,
+  writevSync,
+  writev as writevCb,
+  write as writeCb,
+  writeSync,
+  unlinkSync,
+  closeSync,
+  writeFileSync,
+  constants as FS,
+} from 'node:fs';
+import path from 'node:path';
 import { promisify } from 'node:util';
 import { Readable } from 'node:stream';
 import { GetObjectCommand } from '@aws-sdk/client-s3';
@@ -52,7 +63,17 @@ const {
   workerId = 0, // index of this worker, used to make connection ids globally unique
   bufferPool, // ordered-drop: copy chunks into reused contiguous part buffers
   bufferReturn = true, // ordered-stream: reuse dedicated buffers handed back by main
-  fileAsync, // file mode: write each part asynchronously (don't block the event loop)
+  fileAsync, // legacy (--no-api slice) file mode: write each part asynchronously
+  // file (dispatch/API) mode — SIMPLE inline O_DIRECT writer. This worker downloads
+  // each range into a reusable (block-aligned) buffer and writes it straight to the
+  // destination file at its offset, preferring O_DIRECT (bypass the page cache).
+  // There is no shared queue and no separate writer pool: backpressure is just the
+  // number of in-flight ranges (workers x concurrency) the scheduler dispatches.
+  rangeSize, // max range length (bytes) — sizes the reusable write buffers
+  fileDirect, // request O_DIRECT (opt out => false => buffered writes)
+  fileChunk, // O_DIRECT pwrite granularity within a range
+  fileDiscard, // drain each range WITHOUT writing (network/ingest ceiling A/B)
+  deliveryPath, // dir used for the one-time O_DIRECT support/alignment probe
   profile, // when true, CPU-profile this worker and write a .cpuprofile
   profileDir, // directory for the per-worker .cpuprofile files
   nativeCrc32, // patch @aws-crypto/crc32 to use native zlib.crc32
@@ -194,7 +215,10 @@ async function getPart(part, signal) {
     new GetObjectCommand({
       Bucket: bucket,
       Key: part.key,
-      PartNumber: part.partNumber,
+      // Fetch a fixed-size byte RANGE (planned on main from download.rangeSize),
+      // not a whole part. Arbitrary ranges carry no per-part checksum, so
+      // ChecksumMode is a no-op here unless a range happens to cover the object.
+      Range: `bytes=${part.offset}-${part.offset + part.size - 1}`,
       ...(validateChecksum ? { ChecksumMode: 'ENABLED' } : {}),
     }),
     signal ? { abortSignal: signal } : {},
@@ -300,17 +324,8 @@ function closeFds() {
       }
     }
   }
-  // Path-keyed fds from file (dispatch) mode.
-  if (typeof pathFds !== 'undefined' && pathFds) {
-    for (const fd of pathFds.values()) {
-      try {
-        closeSync(fd);
-      } catch {
-        /* ignore */
-      }
-    }
-    pathFds.clear();
-  }
+  // O_DIRECT + buffered fds from the inline file (dispatch/API) writer.
+  closeFileRecs();
 }
 
 // ---------------------------------------------------------------------------
@@ -376,15 +391,147 @@ function releaseBuf(buf) {
 // thread boundary instead of allocating one per part.
 const streamMode = deliveryMode === 'ordered-stream';
 const fileMode = deliveryMode === 'file';
-// file (dispatch) mode: cache one fd per output path (positional writes at offsets).
-const pathFds = new Map();
-function fdForPath(p) {
-  let fd = pathFds.get(p);
-  if (fd === undefined) {
-    fd = openSync(p, 'r+');
-    pathFds.set(p, fd);
+
+// ---------------------------------------------------------------------------
+// file (dispatch/API) mode: SIMPLE inline O_DIRECT writer.
+//
+// Each range is downloaded into a reusable, block-aligned buffer and written
+// straight to the destination file at its byte offset — preferring O_DIRECT to
+// bypass the page cache (so we measure real disk throughput), with a buffered
+// fallback for the final, non-block-aligned range. No shared queue, no separate
+// writer pool: the only backpressure is the number of in-flight ranges the
+// scheduler dispatches (workers x concurrency).
+// ---------------------------------------------------------------------------
+const ALIGN = 4096; // device logical-block superset; O_DIRECT offset/len/addr unit
+const O_DIRECT = FS.O_DIRECT || 0; // 0 on platforms without it (macOS/Windows)
+// Positional writes always go through the libuv threadpool (promisified fs.write),
+// so a disk write never blocks the worker's event loop / socket draining. The pool
+// is process-global and shared across all workers, so its size (UV_THREADPOOL_SIZE)
+// bounds how many range writes run at once — raise it for high worker counts.
+const writeAsync = promisify(writeCb);
+const RANGE_CAP = rangeSize > 0 ? rangeSize : 16 * 1024 * 1024; // reusable buffer size
+const WRITE_CHUNK = fileChunk > 0 ? fileChunk : RANGE_CAP; // O_DIRECT pwrite granularity
+const wantDirect = fileMode && fileDirect && !fileDiscard && O_DIRECT > 0 && Boolean(deliveryPath);
+let directProbed = false;
+let directUsable = false; // set by the first probe: does O_DIRECT work on this fs?
+
+// O_DIRECT needs the write buffer's ADDRESS block-aligned, but V8 buffer memory
+// isn't. For a given buffer we find the byte offset `pad` (< ALIGN) whose address
+// is aligned by probing a real O_DIRECT write to a temp file on the destination fs.
+// Returns the pad, or -1 if O_DIRECT can't be used on this filesystem at all.
+function probePad(buf) {
+  const probe = path.join(deliveryPath, `.odirect-probe-w${workerId}`);
+  let found = -1;
+  for (let pad = 0; pad < ALIGN; pad += 8) {
+    let fd;
+    try {
+      fd = openSync(probe, FS.O_RDWR | FS.O_CREAT | FS.O_TRUNC | O_DIRECT, 0o600);
+      const n = writeSync(fd, buf, pad, ALIGN, 0);
+      closeSync(fd);
+      fd = undefined;
+      if (n === ALIGN) {
+        found = pad;
+        break;
+      }
+    } catch {
+      try {
+        if (fd !== undefined) closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
   }
-  return fd;
+  try {
+    unlinkSync(probe);
+  } catch {
+    /* ignore */
+  }
+  return found;
+}
+
+// Per-worker pool of reusable range buffers. Each holds one range while it
+// downloads, then is written and returned. With O_DIRECT a buffer is over-sized by
+// ALIGN and its aligned start is `pad`; otherwise pad is 0 (buffered writes).
+const bufSlots = [];
+function acquireSlot() {
+  const s = bufSlots.pop();
+  if (s) return s;
+  const buf = Buffer.allocUnsafeSlow(RANGE_CAP + (wantDirect ? ALIGN : 0));
+  let pad = 0;
+  let direct = false;
+  if (wantDirect) {
+    const p = directUsable || !directProbed ? probePad(buf) : -1;
+    if (!directProbed) {
+      directProbed = true;
+      directUsable = p >= 0;
+      if (workerId === 0) {
+        console.error(
+          directUsable
+            ? `[file] O_DIRECT enabled on ${deliveryPath} (align pad=${p}B)`
+            : `[file] O_DIRECT not usable on ${deliveryPath}; using buffered writes`,
+        );
+      }
+    }
+    if (p >= 0) {
+      pad = p;
+      direct = true;
+    }
+  }
+  return { buf, pad, direct };
+}
+function releaseSlot(s) {
+  bufSlots.push(s);
+}
+
+// One { directFd, bufferedFd } per destination path. directFd is opened O_DIRECT;
+// bufferedFd is opened lazily only when an unaligned (final) range needs it. The
+// output file is pre-created and pre-sized by the benchmark, so O_RDWR (no create).
+const fileRecs = new Map();
+function recForPath(p) {
+  let rec = fileRecs.get(p);
+  if (!rec) {
+    rec = { directFd: null, bufferedFd: null };
+    fileRecs.set(p, rec);
+  }
+  return rec;
+}
+async function pwrite(fd, buf, off, len, pos) {
+  return (await writeAsync(fd, buf, off, len, pos)).bytesWritten;
+}
+async function writeRangeToFile(dest, slot, byteLength, fileOffset) {
+  const rec = recForPath(dest);
+  const { buf, pad, direct } = slot;
+  let w = 0;
+  while (w < byteLength) {
+    const n = Math.min(WRITE_CHUNK, byteLength - w);
+    const off = fileOffset + w;
+    const soff = pad + w;
+    if (direct && n % ALIGN === 0 && off % ALIGN === 0) {
+      if (rec.directFd === null) rec.directFd = openSync(dest, FS.O_RDWR | O_DIRECT);
+      const wrote = await pwrite(rec.directFd, buf, soff, n, off);
+      if (wrote !== n) throw new Error(`short O_DIRECT write ${wrote}/${n} @${off}`);
+    } else {
+      if (rec.bufferedFd === null) rec.bufferedFd = openSync(dest, 'r+');
+      let x = 0;
+      while (x < n) x += await pwrite(rec.bufferedFd, buf, soff + x, n - x, off + x);
+    }
+    w += n;
+  }
+}
+function closeFileRecs() {
+  for (const rec of fileRecs.values()) {
+    try {
+      if (rec.directFd !== null) closeSync(rec.directFd);
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (rec.bufferedFd !== null) closeSync(rec.bufferedFd);
+    } catch {
+      /* ignore */
+    }
+  }
+  fileRecs.clear();
 }
 const returnedBufs = []; // ArrayBuffers handed back by main, available for reuse
 function acquireArrayBuffer(size) {
@@ -436,34 +583,36 @@ if (deliveryMode === 'ordered-stream' || deliveryMode === 'ordered-drop' || deli
         let connId = null;
 
         if (fileMode) {
-          // Download this part and positionally write it to its output file at
-          // part.offset (distributed write, out of order). Nothing crosses to main.
-          const fd = fdForPath(msg.part.file);
-          const chunks = [];
+          // Download the whole range into a reusable (block-aligned) buffer, then
+          // write it straight to the destination file at its offset with O_DIRECT
+          // (buffered fallback for the final, unaligned range). In fileDiscard mode
+          // we drain the range but don't write it (network/ingest ceiling A/B). No
+          // shared queue, no writer pool — just this worker.
+          const slot = acquireSlot();
+          const base = slot.pad; // aligned start within the reusable buffer
           const hasChecksum = await withStallRetry(label, async (signal, bump) => {
             const got = await getPart(msg.part, signal);
             vip = got.vip;
             connId = got.connId;
+            // Refill from byte 0 each attempt: a stall-retry re-downloads the whole
+            // range into the SAME buffer, so a range is never written twice/partially.
             byteLength = 0;
-            chunks.length = 0;
             for await (const chunk of got.body) {
-              chunks.push(chunk);
+              chunk.copy(slot.buf, base + byteLength, 0, chunk.length);
               byteLength += chunk.length;
               bump();
             }
             return got.hasChecksum;
           });
-          // Async positional write on the libuv threadpool: do NOT block the worker's
-          // event loop (a blocking writevSync starves in-flight socket reads + the
-          // stall watchdog, which hangs the last straggler parts on a slow disk).
-          if (chunks.length) await writevAsync(fd, chunks, msg.part.offset);
+          if (!fileDiscard) await writeRangeToFile(msg.part.file, slot, byteLength, msg.part.offset);
+          releaseSlot(slot);
           const downloadMs = performance.now() - t0;
           dPartsDone += 1;
           if (hasChecksum) dChecksummed += 1;
           dispatchInFlight -= 1;
-          bumpProgress(progress, byteLength);
+          bumpProgress(progress, byteLength); // bytes are on disk now (or drained in discard)
           parentPort.postMessage({
-            type: 'part-written',
+            type: 'part-downloaded',
             key: msg.part.key,
             partNumber: msg.part.partNumber,
             byteLength,

@@ -11,11 +11,13 @@
 #   summary.txt          - the formatted console output (throughput + resources)
 #   *.csv / *.svg        - any part-times / time-series artifacts produced
 #
+# The upload sweep creates the objects, so it doubles as the seed for download.
+# There is no separate seeder — run upload before download (mode "both" does this).
+#
 # Usage:
-#   ./scripts/run.sh [both]   [label]     # DEFAULT: seed + download sweep, then upload sweep
-#   ./scripts/run.sh download [label]     # seed (if needed) + download sweep only
-#   ./scripts/run.sh upload   [label]     # upload sweep (forced) only
-#   ./scripts/run.sh bench    [label]     # download sweep WITHOUT seeding
+#   ./scripts/run.sh [both]   [label]     # DEFAULT: upload sweep (seeds), then download sweep
+#   ./scripts/run.sh upload   [label]     # upload sweep (forced) only — also seeds
+#   ./scripts/run.sh download [label]     # download sweep only (objects must already exist)
 #
 # Example: ./scripts/run.sh both aes128-spread
 set -euo pipefail
@@ -71,19 +73,17 @@ MARKER="$DIR/.start"; : > "$MARKER"
 # are appended to summary.txt so each committed run is human-readable at a glance.
 SUMMARY="$DIR/summary.txt"; : > "$SUMMARY"
 
-do_seed()     { echo ">> Seeding configured sizes (skipping existing) ..."; node src/upload-test-data.js; }
 do_download() { echo ">> DOWNLOAD sweep -> $DIR/download-sweep.json"
                 node src/benchmark.js --out "$DIR/download-sweep.json" 2>&1 | tee -a "$SUMMARY"; }
-do_upload()   { echo ">> UPLOAD sweep (forced) -> $DIR/upload-sweep.json"
+do_upload()   { echo ">> UPLOAD sweep (forced; also seeds download objects) -> $DIR/upload-sweep.json"
                 node src/upload-benchmark.js --force --out "$DIR/upload-sweep.json" 2>&1 | tee -a "$SUMMARY"; }
 
 case "$MODE" in
-  both|all) do_seed; do_download; do_upload ;;
-  download) do_seed; do_download ;;
-  bench)    do_download ;;
+  both|all) do_upload; do_download ;;   # upload seeds the objects, then download reads them
   upload)   do_upload ;;
+  download) do_download ;;              # objects must already exist (run upload first)
   *)
-    echo "unknown mode '${MODE}' (use both | download | upload | bench)" >&2
+    echo "unknown mode '${MODE}' (use both | upload | download)" >&2
     exit 1
     ;;
 esac

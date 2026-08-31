@@ -650,11 +650,14 @@ async function runViaManager(manager, cfg, group, reporter, filePaths) {
   manager.resetScheduler();
   const t0 = performance.now();
   reporter?.start();
-  if (cfg.deliveryMode === 'file' && filePaths) {
-    // Distributed file writes: each worker downloads its own parts and positionally
-    // writes them to the pre-sized output file (no stream, no main funnel). We just
-    // fire x concurrent download({file}) calls and await completion.
-    await Promise.all(group.keys.map((key) => manager.download({ bucket: cfg.bucket, key, file: filePaths[key] })));
+  if (cfg.deliveryMode === 'file') {
+    // Distributed file pipeline: each worker downloads its ranges and writes them
+    // straight to disk at their offsets with O_DIRECT (or drains them when
+    // fileDiscard). We fire x concurrent download() calls and await completion. In
+    // discard mode filePaths is null, so no destination path is passed.
+    await Promise.all(
+      group.keys.map((key) => manager.download({ bucket: cfg.bucket, key, file: filePaths ? filePaths[key] : undefined })),
+    );
   } else {
     // Stream: x concurrent download() calls -> per-object ordered Readables, drained
     // concurrently into a discard (optionally throttled) sink; recycle buffers.
@@ -711,7 +714,7 @@ async function benchmarkGroup(cfg, group) {
       const missing = err?.$metadata?.httpStatusCode === 404 || err?.name === 'NotFound';
       throw new Error(
         missing
-          ? `missing object ${key} (need ${group.count} file(s) of ${group.label}; seed them first)`
+          ? `missing object ${key} (need ${group.count} file(s) of ${group.label}; run the upload benchmark first to create them)`
           : `describe ${key}: ${err.message}`,
       );
     }
@@ -747,9 +750,10 @@ async function benchmarkGroup(cfg, group) {
 
   const maxSockets = Math.max(64, cfg.concurrency * 2);
 
-  // 'file' mode: create + pre-size one output file per key.
+  // 'file' mode: create + pre-size one output file per key. Skipped when fileDiscard
+  // (workers drain ranges without writing, so there are no output files to size).
   let filePaths = null;
-  if (cfg.deliveryMode === 'file') {
+  if (cfg.deliveryMode === 'file' && !cfg.fileDiscard) {
     mkdirSync(cfg.deliveryPath, { recursive: true }); // openSync won't create parents
     filePaths = {};
     for (const { key, info } of infos) {
@@ -816,8 +820,12 @@ async function benchmarkGroup(cfg, group) {
         region: cfg.region,
         workers: Math.min(cfg.workers, parts.length),
         concurrency: cfg.concurrency,
+        rangeSize: cfg.rangeSize, // read each object as fixed-size byte ranges
         deliveryMode: cfg.deliveryMode, // 'file' spawns file-writing workers
         deliveryPath: cfg.deliveryPath,
+        fileDirect: cfg.fileDirect,
+        fileChunk: cfg.fileChunk,
+        fileDiscard: cfg.fileDiscard,
         maxBufferedBytes: cfg.maxBufferedBytes,
         streamHwm: cfg.streamHwm,
         bufferReturn: cfg.bufferReturn,
@@ -993,11 +1001,13 @@ function printHuman(cfg, all) {
       })()
     : 'HTTP (no TLS)';
   console.log(
-    `download unit=PartNumber  handler=${cfg.httpHandler}  transport=${tlsNote}  ` +
+    `download unit=range ${formatBytes(cfg.rangeSize)}  handler=${cfg.httpHandler}  transport=${tlsNote}  ` +
       (all.some((r) => r.api)
         ? `api=S3TransferManager  ` +
           (cfg.deliveryMode === 'file'
-            ? `delivery=file (distributed worker writes at offsets -> ${cfg.deliveryPath})  `
+            ? `delivery=file (${cfg.fileDiscard
+                ? 'DISCARD: workers drain ranges, no disk write'
+                : `${cfg.fileDirect ? 'O_DIRECT' : 'buffered'} chunk=${formatBytes(cfg.fileChunk)} async-writes (UV_THREADPOOL_SIZE=${process.env.UV_THREADPOOL_SIZE ?? '4 default'}) -> ${cfg.deliveryPath}`})  `
             : `delivery=stream (x concurrent download() + concurrent drain, per-object Readable, ` +
               `max-buffered ${formatBytes(cfg.maxBufferedBytes)}` +
               `${cfg.consumerRate > 0 ? `, consumer ${formatBytes(cfg.consumerRate)}/s` : ''})  `)

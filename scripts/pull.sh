@@ -32,7 +32,7 @@ cd "$DEST"
 npm install --omit=dev
 
 echo "Ready in ${DEST}. All settings live in bench.config.json. Examples:"
-echo "  ./scripts/sweep-download.sh              # seed + benchmark DOWNLOAD across the size curve"
-echo "  ./scripts/sweep-upload.sh                # benchmark UPLOAD across the size curve"
+echo "  ./scripts/sweep-upload.sh                # benchmark UPLOAD (also creates the objects to download)"
+echo "  ./scripts/sweep-download.sh              # benchmark DOWNLOAD across the size curve (run upload first)"
 echo "  node src/benchmark.js --sizes 100MiB,1GiB   # download specific sizes ad hoc"
 echo "  WORKERS=16 CONCURRENCY=8 ./scripts/sweep-download.sh   # override tunables per-run"

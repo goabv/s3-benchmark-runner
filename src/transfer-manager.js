@@ -42,29 +42,29 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WORKER_PATH = path.join(__dirname, 'download-worker.js');
 const UPLOAD_WORKER_PATH = path.join(__dirname, 'upload-worker.js');
 
-/** Build the PartNumber work list for one object (uniform parts, last is the tail). */
-function buildParts(key, partsCount, firstPartSize, totalSize) {
+/**
+ * Build the read work list for one object as fixed-size byte RANGES of `rangeSize`
+ * (last range is the remainder), independent of the object's multipart layout.
+ * `partNumber` here is just the 1-based sequence index used for in-order delivery.
+ */
+function buildRanges(key, totalSize, rangeSize) {
+  const rs = rangeSize > 0 ? rangeSize : totalSize || 1;
   const parts = [];
-  for (let p = 1; p <= partsCount; p++) {
-    const offset = (p - 1) * firstPartSize;
-    const size = p < partsCount ? firstPartSize : totalSize - offset;
-    parts.push({ key, partNumber: p, offset, size });
+  const n = Math.max(1, Math.ceil(totalSize / rs));
+  for (let i = 0; i < n; i++) {
+    const offset = i * rs;
+    const size = Math.min(rs, totalSize - offset);
+    parts.push({ key, partNumber: i + 1, offset, size });
   }
   return parts;
 }
 
-/** HEAD the object (whole + PartNumber=1) to learn size, part count, part size. */
+/** HEAD the object for its total size (reads are planned as byte ranges, not parts). */
 async function describeObject(client, bucket, key) {
   const whole = await client.send(
     new HeadObjectCommand({ Bucket: bucket, Key: key, ChecksumMode: 'ENABLED' }),
   );
-  const totalSize = Number(whole.ContentLength);
-  const part1 = await client.send(
-    new HeadObjectCommand({ Bucket: bucket, Key: key, PartNumber: 1, ChecksumMode: 'ENABLED' }),
-  );
-  const partsCount = part1.PartsCount ? Number(part1.PartsCount) : 1;
-  const firstPartSize = Number(part1.ContentLength);
-  return { totalSize, partsCount, firstPartSize };
+  return { totalSize: Number(whole.ContentLength) };
 }
 
 export class S3TransferManager {
@@ -86,9 +86,22 @@ export class S3TransferManager {
     // — real API callers that keep chunks must leave this off (they just never call
     // recycle(), so nothing is returned and buffers are simply GC'd).
     this.bufferReturn = Boolean(cfg.bufferReturn);
-    // download 'file' mode: workers positionally write their own parts to disk (no
+    // download 'file' mode: each download worker writes the ranges it fetches
+    // straight to disk with O_DIRECT (no separate writer pool, no shared queue, no
     // reorder buffer, no main funnel). Anything else = ordered-stream (Readable out).
-    this.downloadFile = cfg.deliveryMode === 'file';
+    this.downloadFile = this.mode === 'download' && cfg.deliveryMode === 'file';
+    // Download read granularity: each object is fetched as fixed-size byte RANGES of
+    // this size (independent of how it was uploaded / its part layout).
+    this.rangeSize = cfg.rangeSize > 0 ? cfg.rangeSize : 16 * 1024 * 1024;
+    if (this.downloadFile) {
+      // download 'file' mode is the SIMPLE inline O_DIRECT writer: each download
+      // worker writes the ranges it fetches straight to disk (no separate writer
+      // pool, no shared queue). These knobs are forwarded to the workers; the only
+      // backpressure is the in-flight range count (workers x concurrency).
+      this.fileChunk = cfg.fileChunk > 0 ? cfg.fileChunk : 8 * 1024 * 1024; // O_DIRECT pwrite granularity
+      this.fileDirect = cfg.fileDirect !== false; // O_DIRECT unless explicitly opted out
+      this.fileDiscard = Boolean(cfg.fileDiscard); // drain ranges without writing (network A/B)
+    }
     this.progress = progressView(cfg.progressBuf);
 
     // Pool + scheduler state.
@@ -117,6 +130,9 @@ export class S3TransferManager {
     this._spawnStart = performance.now();
     this.spawnMs = 0;
     this._workerDone = 0;
+    // One pool now (the download workers write their own ranges in file mode).
+    this._readyNeed = this.nWorkers;
+    this._workerDoneNeed = this.nWorkers;
     this._closeResolve = null;
     this._closePromise = null;
     this._failed = null;
@@ -140,8 +156,11 @@ export class S3TransferManager {
     this.bufWaiters = []; // carvers awaiting a free pool buffer (backpressure)
 
     this.control = makeClient({ region: cfg.region });
-    if (this.mode === 'upload') this._spawnUploadPool();
-    else this._spawnPool();
+    if (this.mode === 'upload') {
+      this._spawnUploadPool();
+    } else {
+      this._spawnPool();
+    }
   }
 
   _spawnPool() {
@@ -157,6 +176,12 @@ export class S3TransferManager {
           maxSockets,
           validateChecksum: c.validateChecksum,
           deliveryMode: this.downloadFile ? 'file' : 'ordered-stream',
+          // file mode: this worker writes each range it downloads straight to disk.
+          rangeSize: this.rangeSize, // sizes the reusable (aligned) write buffers
+          fileDirect: this.downloadFile ? this.fileDirect : undefined,
+          fileChunk: this.downloadFile ? this.fileChunk : undefined,
+          fileDiscard: this.downloadFile ? this.fileDiscard : undefined,
+          deliveryPath: this.downloadFile ? c.deliveryPath : undefined,
           logConnections: c.logConnections,
           spreadConnections: c.spreadConnections,
           tls: c.tls,
@@ -227,7 +252,7 @@ export class S3TransferManager {
 /** Worker -> main message pump. */
 S3TransferManager.prototype._onMessage = function (wi, msg) {
   if (msg.type === 'ready') {
-    if (++this._readyCount === this.nWorkers) {
+    if (++this._readyCount === this._readyNeed) {
       this.spawnMs = performance.now() - this._spawnStart;
       this._readyResolve();
     }
@@ -255,9 +280,10 @@ S3TransferManager.prototype._onMessage = function (wi, msg) {
     this.totalInFlight -= 1;
     this._drainKey(msg.key);
     this._dispatchMore();
-  } else if (msg.type === 'part-written') {
-    // file mode: the worker downloaded + positionally wrote this part to disk (no
-    // bytes crossed to main, no reorder). Just account it and complete when done.
+  } else if (msg.type === 'part-downloaded') {
+    // file mode: the worker downloaded this range AND wrote it to disk (or drained
+    // it in fileDiscard). Count the bytes, free the lane, and resolve the object
+    // once every one of its bytes has landed.
     this.freeLanes[wi] += 1;
     this.totalInFlight -= 1;
     this.deliveredBytes += msg.byteLength;
@@ -275,11 +301,11 @@ S3TransferManager.prototype._onMessage = function (wi, msg) {
     }
     const obj = this.objects.get(msg.key);
     if (obj) {
-      obj.written = (obj.written || 0) + 1;
-      if (obj.written === obj.partsCount && !obj.done) {
+      obj.written = (obj.written || 0) + msg.byteLength;
+      if (obj.written >= obj.contentLength && !obj.done) {
         obj.done = true;
-        this.objects.delete(msg.key);
-        obj.resolve({ key: msg.key, bytes: obj.contentLength });
+        this.objects.delete(obj.key);
+        obj.resolve({ key: obj.key, bytes: obj.contentLength });
       }
     }
     this._dispatchMore();
@@ -287,7 +313,7 @@ S3TransferManager.prototype._onMessage = function (wi, msg) {
     if (msg.ipCounts) for (const [ip, c] of msg.ipCounts) this.ipCounts.set(ip, (this.ipCounts.get(ip) || 0) + c);
     if (msg.ipThroughput) for (const [ip, v] of msg.ipThroughput) this.ipThroughput.set(ip, (this.ipThroughput.get(ip) || 0) + v);
     if (!this.tlsInfo && msg.tlsInfo) this.tlsInfo = msg.tlsInfo;
-    if (++this._workerDone === this.nWorkers && this._closeResolve) this._closeResolve();
+    if (++this._workerDone === this._workerDoneNeed && this._closeResolve) this._closeResolve();
   } else if (msg.type === 'error') {
     this._fail(new Error(`worker: ${msg.message}`));
   }
@@ -378,21 +404,22 @@ S3TransferManager.prototype.download = async function ({ bucket, key, file }) {
   if (this._failed) throw this._failed;
   const b = bucket ?? this.cfg.bucket;
   const info = await describeObject(this.control, b, key);
-  const parts = buildParts(key, info.partsCount, info.firstPartSize, info.totalSize);
+  const parts = buildRanges(key, info.totalSize, this.rangeSize);
 
-  // file mode: workers positionally write their own parts to `file` at part.offset
-  // (distributed, out of order, no reorder buffer, no main funnel). Resolves when all
-  // of this object's parts are written. The file must already be sized (caller's job).
+  // file mode: each range is dispatched to a download worker, which writes it
+  // straight to disk at its offset with O_DIRECT (buffered tail fallback), out of
+  // order and with no reorder buffer. Resolves once every byte of this object has
+  // landed (driven by 'part-downloaded' byte counts). The file must already be sized.
   if (this.downloadFile || file) {
     const dest = file ?? this.cfg.deliveryPath;
-    for (const p of parts) p.file = dest; // worker reads p.file to know where to write
+    for (const p of parts) p.file = dest; // worker opens/writes this destination
     const obj = {
       key,
       parts,
       cursor: 0,
-      partsCount: info.partsCount,
+      partsCount: parts.length,
       contentLength: info.totalSize,
-      written: 0,
+      written: 0, // BYTES written to disk so far (drives completion)
       done: false,
       resolve: null,
       reject: null,
@@ -415,7 +442,7 @@ S3TransferManager.prototype.download = async function ({ bucket, key, file }) {
     key,
     parts,
     cursor: 0,
-    partsCount: info.partsCount,
+    partsCount: parts.length,
     contentLength: info.totalSize,
     nextN: 1,
     paused: false,

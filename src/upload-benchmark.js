@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
-import { writeFileSync, mkdirSync, createWriteStream, rmSync } from 'node:fs';
+import { writeFileSync, mkdirSync, createWriteStream, statSync, statfsSync } from 'node:fs';
 import { randomFillSync } from 'node:crypto';
 import { createRequire } from 'node:module';
 import os from 'node:os';
@@ -227,8 +227,33 @@ async function benchmarkGroup(cfg, group) {
       mkdirSync(cfg.sourcePath, { recursive: true });
       const safe = group.label.replace(/[^\w.-]/g, '_');
       sourceFilePath = path.join(cfg.sourcePath, `s3ulbench-src-${safe}`);
-      if (!cfg.json) console.error(`[setup] writing ${formatBytes(bytes)} source file (untimed) ...`);
-      await writeRandomFile(sourceFilePath, bytes);
+      // Reuse an already-staged source file of the exact size (staging a large file
+      // is slow, untimed setup). Delete the file to force a regenerate.
+      let existing = null;
+      try { existing = statSync(sourceFilePath); } catch { /* missing */ }
+      if (existing && existing.size === bytes) {
+        if (!cfg.json) console.error(`[setup] reusing existing ${formatBytes(bytes)} source file: ${sourceFilePath}`);
+      } else {
+        // Preflight: never stage a source file bigger than the target filesystem's
+        // free space. This turns "fill the fs (e.g. tmpfs /tmp) and freeze the box"
+        // into a fast, clear error. Account for space reclaimed by overwriting an
+        // existing (wrong-size) file at this path.
+        const fss = statfsSync(cfg.sourcePath);
+        const freeBytes = fss.bavail * fss.bsize + (existing ? existing.size : 0);
+        if (freeBytes < bytes) {
+          throw new Error(
+            `staging ${formatBytes(bytes)} source file needs more than the ${formatBytes(freeBytes)} free at ${cfg.sourcePath}. ` +
+              `Set upload.sourcePath to a volume with room (e.g. a large mount), or reduce the size. ` +
+              `The default os.tmpdir() is often tmpfs (RAM-backed) — do not stage large files there.`,
+          );
+        }
+        if (!cfg.json) {
+          console.error(
+            `[setup] writing ${formatBytes(bytes)} source file (untimed)${existing ? ` (size ${formatBytes(existing.size)} != ${formatBytes(bytes)}, regenerating)` : ''} ...`,
+          );
+        }
+        await writeRandomFile(sourceFilePath, bytes);
+      }
       staticSources = keysToUpload.map((key) => ({ key, file: sourceFilePath, size: bytes }));
     } else {
       // stream: pre-fill a small template (untimed); a fresh Readable per object per run.
@@ -329,7 +354,8 @@ async function benchmarkGroup(cfg, group) {
     };
   } finally {
     if (manager && !manager._closePromise) await manager.close().catch(() => {});
-    if (sourceFilePath) rmSync(sourceFilePath, { force: true });
+    // Keep the staged source file so it can be reused next run (staging a large file
+    // is expensive). Delete it manually (or it's overwritten if the size changes).
     control.destroy();
   }
 }

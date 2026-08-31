@@ -1,26 +1,27 @@
 # S3 Benchmark Runner — AWS SDK for JavaScript v3
 
 Measures parallel download throughput from S3 using **worker threads**, where each
-worker downloads objects **by `PartNumber`** on top of `@aws-sdk/client-s3`.
-Requesting a part by number (rather than an arbitrary byte range) aligns every
-request to the object's original multipart-upload boundaries and makes S3 return
-that part's stored **CRC32** checksum — which the SDK validates automatically as
-the body is read. Reports throughput (MiB/s and Gbps) per object.
+worker downloads objects as fixed-size **byte ranges** (`Range:` GETs) on top of
+`@aws-sdk/client-s3`. The range size (`rangeSize`) is set in the `download` section
+and is independent of how the object was uploaded (its part layout). Reports
+throughput (MiB/s and Gbps) per object.
 
 ## What it does
 
-- HEADs the object to discover its `PartsCount` (from the multipart upload).
-- Distributes part numbers `1..N` round-robin across `workers` worker threads.
-- Each worker runs up to `concurrency` `PartNumber` GETs in parallel with
-  `ChecksumMode: ENABLED`, draining (or optionally keeping) the bodies.
-- The `med`/`best Gbps` window is the part transfer only (workers ready → all parts
+- HEADs the object to discover its total size.
+- Splits it into fixed-size byte ranges of `rangeSize` and distributes them
+  round-robin across `workers` worker threads.
+- Each worker runs up to `concurrency` ranged GETs in parallel, draining (or
+  writing, in `file` mode) the bodies. (Arbitrary ranges carry no per-part
+  checksum, so per-part validation applies only when a range covers a stored part.)
+- The `med`/`best Gbps` window is the transfer only (workers ready → all ranges
   fetched and drained; for `ordered-stream`, until the consumer finishes the stream).
   Worker spawn / client init are excluded. An extra `e2e Gbps` column reports the
   same transfer plus **every recurring per-call planning cost**: `HeadObject`
-  (`describeMs`), `buildParts` (part-boundary computation), and `assignParts`/queue-sort
-  (dispatch planning) — i.e. "download call → drained," to line up with an SDK public
-  API that does all of this inside one call. Genuinely one-time costs (worker-thread
-  spawn, client init, data generation) stay excluded, since a warm SDK transfer manager
+  (`describeMs`), range planning, and dispatch planning — i.e. "download call →
+  drained," to line up with an SDK public API that does all of this inside one call.
+  Genuinely one-time costs (worker-thread spawn, client init, data generation) stay
+  excluded, since a warm SDK transfer manager
   does not repay them per call. The footer prints the breakdown. On in-region hosts these
   helpers are a few ms so `e2e ≈ transfer`; they matter most for small objects.
 - Runs `warmup` unmeasured iterations, then `iterations` measured ones, and
@@ -38,17 +39,16 @@ and one `S3Client` per worker (clients are never shared across threads).
 bench.config.json       # single source of truth for all settings
 src/
   benchmark.js          # download orchestrator (worker_threads + timing/reporting)
-  download-worker.js    # download worker: PartNumber GETs, delivery modes, stall-retry
-  upload-benchmark.js   # upload orchestrator (multipart, worker_threads)
+  download-worker.js    # download worker: ranged GETs, delivery modes, inline O_DIRECT file writes, stall-retry
+  upload-benchmark.js   # upload orchestrator (multipart, worker_threads) — also seeds download objects
   upload-worker.js      # upload worker: parallel UploadPart
-  upload-test-data.js   # seed a bucket with multipart objects (CRC32 per part)
   s3.js                 # S3Client factory (agents, DNS spread, cipher, socket capture)
   config.js             # config-file + CLI parsing, size/throughput helpers
   resource-monitor.js   # peak/avg RSS + CPU% + MEM% sampling
   ip-throughput.js      # per-IP throughput tracking + JSONL history
   plot.js               # dependency-free SVG plot for the ordered-stream time series
 scripts/
-  sweep-download.sh     # EC2: seed + benchmark download across the size curve
+  sweep-download.sh     # EC2: benchmark download across the size curve (run upload first)
   sweep-upload.sh       # EC2: benchmark multipart upload across the size curve
   sweep-download.ps1    # Windows equivalents
   sweep-upload.ps1
@@ -63,13 +63,13 @@ test/
 
 - Node.js >= 18 (tested on 24).
 - AWS credentials. Locally use a profile/env; on EC2 prefer an **instance role**
-  with `s3:GetObject` (and `s3:PutObject` if you seed data from the box).
+  with `s3:GetObject` (and `s3:PutObject` to run the upload benchmark from the box).
 
 ## Configuration (single source of truth)
 
 All settings live in **`bench.config.json`** at the project root. Both Node tools
-(`benchmark.js`, `upload-benchmark.js`, `upload-test-data.js`) and every sweep
-script read it, so you edit one file to change everything. You normally run the
+(`benchmark.js`, `upload-benchmark.js`) and every sweep script read it, so you edit
+one file to change everything. You normally run the
 benchmarks with **no arguments** — the config is the interface. CLI flags and
 sweep env vars exist only for ad-hoc overrides (see the [CLI appendix](#appendix-cli-reference)).
 
@@ -138,13 +138,14 @@ A representative config (this repo's current one):
 
 | Key | Example | What it controls and why |
 |-----|---------|--------------------------|
-| `bucket` | `s3dl-bench-usw2-…` | Target S3 bucket for both seeding and benchmarking. Set once so no tool needs `--bucket`. |
+| `bucket` | `s3dl-bench-usw2-…` | Target S3 bucket for uploads and downloads. Set once so no tool needs `--bucket`. |
 | `region` | `us-west-2` | AWS region — **must** match the bucket. Always benchmark in-region; there's no implicit default region. |
-| `dataPrefix` | `bench/` | Key prefix for test objects. `sizes` expand to `<dataPrefix><size>.bin` (or `-<i>.bin` for multi-file), so the seeder and both benchmarks agree on keys. |
+| `dataPrefix` | `bench/` | Key prefix for test objects. `sizes` expand to `<dataPrefix><size>.bin` (or `-<i>.bin` for multi-file), so both benchmarks agree on keys. |
 | `codePrefix` | `code/` | S3 staging prefix used by `push.ps1`/`pull.sh` for the code-sync loop. Not read by the benchmarks themselves. |
 | `sizes` | `[{ "size":"30GiB","count":10 }]` | The workload. Each entry is an object size and how many **distinct files** of it to use; all files of a size are pooled into one timed run. More files = more objects/connections = easier NIC saturation. Also accepts strings: `"30GiB"` or `"30GiB:10"`. |
-| `partSize` | `32MiB` | Multipart part size **at upload time** — this defines the boundaries the download reads back by `PartNumber`. Smaller parts → more parts → finer parallelism, smaller per-part memory, and (ordered-stream) smaller overshoot. Change it and re-seed to experiment with boundaries. |
-| `checksum` | `CRC32` | Per-part checksum algorithm used when seeding/uploading. `CRC32` uses Node's native `zlib.crc32` (fast); `CRC32C` is pure-JS and much slower at high throughput; `SHA256`/`SHA1` also available. |
+| `checksum` | `CRC32` | Per-part checksum algorithm used when uploading. `CRC32` uses Node's native `zlib.crc32` (fast); `CRC32C` is pure-JS and much slower at high throughput; `SHA256`/`SHA1` also available. |
+
+> **No separate seeder.** The download benchmark reads objects the **upload benchmark** creates — run the upload sweep first (or `./scripts/run.sh both`, which uploads then downloads). `partSize` now lives in the `upload` section; the download read size is `rangeSize` in the `download` section and is independent of the object's part layout.
 
 ### `download` section
 
@@ -155,7 +156,8 @@ A representative config (this repo's current one):
 | `iterations` | `1` | Measured runs per size. More iterations tighten the median (a 300 GiB run is long, hence 1 here). |
 | `warmup` | `1` | Unmeasured runs before timing. Primes JIT/describe; note workers/connections are recreated each iteration, so it does not pre-warm the measured sockets. |
 | `keep` | `false` | If `true`, retain downloaded bytes in memory instead of discarding. Leave `false` to measure the pure network/CPU ceiling without buffering cost. |
-| `validateChecksum` | `true` | Whether the SDK validates each part's stored checksum as it streams. Set `false` to isolate raw transfer throughput from the checksum CPU cost. |
+| `validateChecksum` | `true` | Whether the SDK validates each part's stored checksum as it streams. Only applies when reads align to stored parts; in `rangeSize` mode arbitrary ranges carry no per-part checksum, so this is effectively a no-op. |
+| `rangeSize` | `16MiB` | **Read granularity.** The download fetches each object as fixed-size **byte ranges** of this size (one `Range:` GET per range), independent of how the object was uploaded or its part layout. Smaller = more requests/connections (finer parallelism); larger = fewer, bigger reads. **Config-only** (no CLI flag). |
 | `deliveryMode` | `ordered-drop` | What happens to bytes: `discard` (drain + drop on arrival — pure ceiling, no ordering), `ordered-drop` (reorder buffer, delivered in part order then dropped at the frontier — models the ordering machinery with no consumer), `ordered-stream` (reorder, then transfer each part zero-copy into a per-object `Readable` a consumer drains — models a real user reading a stream per object), or `file` (positional write to disk). See [Delivery modes](#delivery-modes-what-happens-to-downloaded-bytes). |
 | `api` | `true` (default) | Route the download through the `S3TransferManager` API — **this is the default and recommended path**. The pool is constructed **once** (spawn + client init = one-time, reported separately as "pool spawn"); each iteration fires **x concurrent `download()` calls** (one per object) and drains the returned per-object `Readable`s **concurrently**. The measured window is the full "`download()` call → streams drained", so `med`/`best`/`e2e` all include HeadObject + planning — the cleanest apples-to-apples with a warm transfer manager. Delivery is always per-object streams; `deliveryMode` is ignored. Set `api:false` (or `--no-api`) to fall back to the legacy `deliveryMode` run loop (`discard`/`ordered-drop`/`ordered-stream`/`file`). See [Download API](#download-api-s3transfermanager). |
 | `maxBufferedBytes` | `64GiB` | **ordered modes only.** Cap on the completed-but-undelivered reorder backlog; dispatch throttles above it (with one-part liveness so it can't hang). Bigger = keeps full concurrency at higher memory; smaller = tighter RSS but can throttle behind a slow low part. |
@@ -163,6 +165,9 @@ A representative config (this repo's current one):
 | `consumerRate` | `0` | **ordered-stream only.** Throttle the consumer to this many bytes/sec per object (e.g. `500MiB`), to model a slow reader and exercise backpressure end-to-end. `0` = unlimited. |
 | `bufferReturn` | `true` | **ordered-stream only.** After the consumer reads a part, transfer its buffer back to the owning worker for reuse, so a bounded set of buffers ping-pongs across the thread boundary (zero-copy both ways) instead of allocating one per part. |
 | `streamHwm` | `2 × partSize` | **ordered-stream only.** Per-object stream highWaterMark, applied to both the object `Readable` and its consumer sink. It's a soft backpressure threshold (not a hard cap): bigger lets more in-order parts flush before the object pauses, at the cost of more resident memory per active object. Omit (or `0`) for the `2 × partSize` auto-default. |
+| `fileDirect` | `true` | **file only.** Each download worker writes its ranges to disk with **O_DIRECT** (bypass the page cache) — no separate writer pool. Falls back to buffered writes automatically when O_DIRECT isn't supported (non-Linux, or a filesystem that rejects it — detected by a startup probe) or for a non-block-aligned tail piece. Opt out with `false` / `--no-file-direct`. |
+| `fileChunk` | `8MiB` | **file only.** O_DIRECT **pwrite granularity**: each range is written to disk in `fileChunk`-sized aligned pieces. Keep it a multiple of 4 KiB so pieces stay O_DIRECT-aligned; a short/unaligned tail piece falls back to a buffered write. |
+| `fileDiscard` | `false` | **file only.** A/B toggle: when `true`, each worker **drains** its ranges but does **not** write them to disk (no fds, no O_DIRECT) — the download path is otherwise identical. Use it to measure the **network + ingest ceiling** with the same config, then compare against `false` (with disk) to see how much the disk write costs. |
 | `timeseries` | `false` | **ordered modes only.** Sample RSS / buffered parts / in-flight / CPU every 500 ms → CSV + SVG plot. Off for normal runs. |
 | `partTimes` | `true` | Record every part's download time (+ serving `vip`/`conn_id`) to CSV and print p50/p90/p99/p99.9 latency. Also enables the socket-capture middleware. All delivery modes. |
 | `stallTimeoutMs` | `10000` | Abort + re-fetch a part that reads **no bytes** for this long (a stuck connection blocking in-order delivery). `0` disables the watchdog. |
@@ -184,6 +189,7 @@ A representative config (this repo's current one):
 | `iterations` | `1` | Measured upload runs per size. |
 | `warmup` | `1` | Unmeasured priming run. |
 | `forceUpload` | `false` | If `true`, upload even when a matching object already exists; otherwise skip objects whose size **and** part size already match. |
+| `partSize` | `32MiB` | Multipart part size for uploads — the boundaries objects are written with (per-part checksums). This is **independent of the download `rangeSize`**: the download reads by byte range, not by these part boundaries. Change it and re-upload to experiment. |
 | `deliveryMode` | `memory` | Where each object's bytes come from (all through the `S3TransferManager` API — the only upload path). `memory`: pre-filled buffers per object (filled **untimed**; pure network/CPU ceiling; needs `sum(object sizes)` RAM, preflight-guarded) — use `memoryInputType` for the shape. `file`: a source file per object, each **worker positionally reads its own part ranges** (distributed ingress; disk read inside the timed window). `stream`: a synthetic customer `Readable` per object from main, carved on main (ingress memcpy inside the window). See [Upload sources](#upload-sources). |
 | `memoryInputType` | `parts` | **memory only.** `parts`: part-sized standalone Buffers per object, **transferred** (zero-copy ownership) to workers then back (reusable). `sab`: one `SharedArrayBuffer` per object, workers read **zero-copy slices** (shared). |
 | `uploadMaxBuffered` | `0` (auto) | **file / stream only.** Cap (bytes) on the in-flight part buffer pool. `0` = auto (`workers × concurrency + 1` parts). `memory` mode doesn't use it. |
@@ -213,10 +219,11 @@ laptop is meaningless).
 npm install               # once, on the box (pull.sh does this for you)
 ```
 
-**Download sweep** — seeds the configured sizes (skipping objects that already
-exist at the right size + part size), then benchmarks download:
+**Download sweep** — benchmarks download across the configured sizes. The objects
+must already exist, so run the **upload sweep first** (it creates them):
 
 ```bash
+./scripts/sweep-upload.sh                            # create the objects (also measures upload)
 ./scripts/sweep-download.sh                          # -> results/download-sweep-<ts>.json
 WORKERS=16 CONCURRENCY=8 ./scripts/sweep-download.sh  # ad-hoc tunable overrides
 ```
@@ -233,12 +240,12 @@ FORCE=0 ./scripts/sweep-upload.sh                     # respect config forceUplo
 > (e.g. 30 GiB × count × iterations). Trim `sizes` for a quick check first.
 
 Both scripts accept these override env vars: `WORKERS`, `CONCURRENCY`,
-`ITERATIONS`, `WARMUP`, `PART_SIZE` — everything else comes from the config. They
-also export `UV_THREADPOOL_SIZE=64` by default (raise libuv's 4-thread pool so
-async file writes / DNS lookups don't serialize); override with
-`UV_THREADPOOL_SIZE=128 ./scripts/sweep-download.sh`. The download run header echoes
-the active file-write strategy, e.g. `delivery=file (writes async,
-UV_THREADPOOL_SIZE=64)` or `(writes sync/blocking)`, so you can confirm at a glance.
+`ITERATIONS`, `WARMUP` — everything else comes from the config. They also export
+`UV_THREADPOOL_SIZE=64` by default (raise libuv's 4-thread pool so background I/O /
+DNS lookups don't serialize); override with `UV_THREADPOOL_SIZE=128
+./scripts/sweep-download.sh`. The download run header echoes the delivery mode
+(e.g. `delivery=file (distributed worker writes at offsets ...)`) so you can confirm
+at a glance.
 
 Windows equivalents (for local smoke tests; real numbers need the EC2 box):
 
@@ -276,27 +283,32 @@ a `"<size>:<count>"` string:
 All files of a size are handled **together** — their parts are pooled across the
 worker pool and timed as one run, with aggregate throughput reported. This is useful
 for saturating the NIC (more objects = more connections, spread across S3 keys).
-The sweep scripts seed and benchmark exactly what `sizes` describes.
+The upload sweep creates exactly what `sizes` describes; the download sweep then
+benchmarks those objects.
 
 Keys are `<dataPrefix><size>.bin` for count 1, or `<dataPrefix><size>-<i>.bin` for
-count >1 (e.g. `bench/1gib-0.bin` … `bench/1gib-3.bin`). The download sweep seeds
-the matching files automatically; the **download benchmark fails** if a required
-file is missing:
+count >1 (e.g. `bench/1gib-0.bin` … `bench/1gib-3.bin`). The upload sweep creates the
+matching files; the **download benchmark fails** if a required file is missing:
 
 ```
-[error] 30GiB: missing object bench/30gib-1.bin (need 2 file(s) of 30GiB; seed them first)
+[error] 30GiB: missing object bench/30gib-1.bin (need 2 file(s) of 30GiB; run the upload benchmark first to create them)
 ```
 
-## Seeding & re-seeding
+## Creating the objects (upload = seed)
 
-`./scripts/sweep-download.sh` seeds automatically before benchmarking (there's also
-a standalone `node src/upload-test-data.js`, arg-free, that reads the config).
-Seeding **skips** an object only when it already exists at **both** the expected
-total size and the configured `partSize`. So if you change `partSize` in
-`bench.config.json`, the next seed **re-uploads** the affected objects with the new
-boundaries — you can experiment with part sizes just by editing the config and
-re-running the sweep. Set `"forceUpload": true` (in the `upload` section) to always
-re-upload regardless.
+There is no separate seeder. The **upload benchmark** writes objects to the same
+keys the download reads (`<dataPrefix><size>.bin`), so running it creates the data:
+
+```bash
+./scripts/sweep-upload.sh      # or: ./scripts/run.sh both   (uploads, then downloads)
+```
+
+The upload benchmark **skips** an object only when it already exists at **both** the
+expected total size and the configured `upload.partSize`; change `partSize` and it
+re-uploads with the new boundaries. Set `"forceUpload": true` (in the `upload`
+section), or use `sweep-upload.sh` (which forces by default), to always re-upload.
+Note the download's `rangeSize` is independent of `partSize` — you can re-run the
+download benchmark with different `rangeSize` values without re-uploading.
 
 ## Upload benchmark
 
@@ -396,11 +408,10 @@ committable run under `results/runs/<timestamp>[-label]/` (config snapshot +
 environment + results + any CSV/SVG artifacts) and uploads it to S3:
 
 ```bash
-./scripts/run.sh                          # DEFAULT: seed + download sweep, then upload sweep
+./scripts/run.sh                          # DEFAULT: upload sweep (seeds), then download sweep
 ./scripts/run.sh both aes128-spread       # same, with a label
-./scripts/run.sh download aes128-spread   # download sweep only (seeds first)
-./scripts/run.sh bench    quick           # download sweep, skip seeding
-./scripts/run.sh upload   file-source     # forced upload sweep only
+./scripts/run.sh upload   file-source     # forced upload sweep only (also seeds)
+./scripts/run.sh download aes128-spread   # download sweep only (objects must already exist)
 ```
 
 With the default `both` mode you get one run folder containing both
@@ -465,12 +476,14 @@ the `download` section:
 | `discard` (default) | Drain and throw away each part on arrival | Pure network/CPU throughput ceiling | Minimal memory |
 | `ordered-drop` | Buffer parts, deliver strictly in part order, then drop (free) at the frontier — no consumer | The reorder/backpressure machinery in isolation (infinitely fast sink) | Holds out-of-order parts in memory (head-of-line blocking) |
 | `ordered-stream` | Buffer parts, then **transfer** each (zero-copy) into a per-object `Readable` a consumer drains | A real user reading a stream per object | Reorder buffer + cross-thread hand-off + consumer-driven backpressure |
-| `file` | Positional-write each part to its byte offset in a local file | Downloading to disk | Disk write; no reorder buffer (out-of-order writes are fine) |
+| `file` | Each download worker writes the ranges it fetches straight to disk at their byte offsets with **O_DIRECT** (async pwrite on the libuv threadpool) | Downloading to disk with page-cache bypass | One reusable aligned buffer per in-flight range; no reorder buffer; no separate writer pool |
 
 ```json
 "download": {
-  "deliveryMode": "ordered-drop",   // discard | ordered-drop | ordered-stream | file
-  "deliveryPath": "/mnt/nvme"       // output dir for "file" mode (default OS temp)
+  "deliveryMode": "file",           // discard | ordered-drop | ordered-stream | file
+  "deliveryPath": "/mnt/nvme",      // output dir for "file" mode (default OS temp)
+  "fileDirect": true,               // O_DIRECT writes (opt out: false / --no-file-direct)
+  "fileChunk": "8MiB"               // aligned O_DIRECT pwrite granularity within a range
 }
 ```
 
@@ -480,10 +493,16 @@ By default (`download.api: true`) the benchmark runs through a Transfer-Manager-
 wrapper, `S3TransferManager` (the same class serves uploads via `upload()`/`uploadMany()`
 — see below). This makes the measurement boundary match a real transfer manager's public
 API: construct once, then call `download()` per object. `deliveryMode` picks the shape:
-- **`file`** — `download({ bucket, key, file })` returns a promise (no stream). Each
-  **worker positionally writes its own parts** to the pre-sized output file at their byte
-  offsets (`writevSync` at `part.offset`) — distributed, out of order, **no reorder buffer
-  and no main funnel**. Fastest download-to-disk path.
+- **`file`** — `download({ bucket, key, file })` returns a promise (no stream). Each download
+  worker downloads a range into a reusable, block-aligned buffer and writes it straight to the
+  destination file at its byte offset, preferring **O_DIRECT** (page-cache bypass) with a
+  buffered fallback for the final unaligned range or filesystems that reject it — out of order,
+  **no reorder buffer, no writer pool, no main funnel**. Writes are async (promisified `fs.write`
+  on the libuv threadpool), so the disk write never blocks socket draining; the threadpool is
+  process-global, so raise `UV_THREADPOOL_SIZE` for high worker counts. Backpressure is simply
+  the in-flight range count (`workers × concurrency`). Tunables: `fileDirect` (O_DIRECT opt-out),
+  `fileChunk` (O_DIRECT pwrite granularity, default 8 MiB), `fileDiscard` (drain without writing
+  — network/ingest ceiling A/B).
 - **anything else** (`discard`/`ordered-drop`/`ordered-stream`) — `download({ bucket, key })`
   returns an ordered `Readable` (`body`); the harness drains it to a discard sink (pure
   throughput; a slow reader can be modeled with `consumerRate`).
@@ -504,7 +523,7 @@ CompleteMPU`, pool spawn one-time. See [Upload sources](#upload-sources).
 const tm = new S3TransferManager(cfg);      // spawns the worker pool ONCE (one-time cost)
 await tm.ready();
 
-// single object -> a Readable of the object's bytes, reassembled in PartNumber order
+// single object -> a Readable of the object's bytes, reassembled in range order
 const { body, contentLength } = await tm.download({ bucket, key });
 await pipeline(body, sink);
 
@@ -699,8 +718,8 @@ A single slow or stuck connection on a low-numbered part can stall in-order
 delivery and let the reorder buffer balloon (see the ordered-stream notes above).
 To guard against this, each part fetch runs under a **stall watchdog**: if a part
 reads no bytes for `stallTimeoutMs` (default 10000; set `0` to disable), the request
-is aborted and the whole part is re-fetched from scratch (a ranged GET by PartNumber
-is idempotent, and the retry typically lands on a fresh S3 front-end). Up to
+is aborted and the whole range is re-fetched from scratch (a ranged GET is
+idempotent, and the retry typically lands on a fresh S3 front-end). Up to
 `partRetries` (default 3) attempts before the run fails.
 
 ```json
@@ -952,9 +971,10 @@ AWS credentials + the configured bucket; cleans up after itself.
 - Draining bodies (default) measures transfer throughput without disk/memory
   bottlenecks. Set `"keep": true` only if you specifically want to include
   buffering cost.
-- The `[done]` line reports `N/M parts checksum-validated`; expect `M/M` for a
-  CRC32-seeded object. `0/M` means the object wasn't uploaded with per-part
-  checksums (re-seed with `"checksum": "CRC32"`).
+- The `[done]` line reports `N/M ranges checksum-validated`. In `rangeSize` mode
+  this is normally `0/M`: arbitrary byte ranges don't return a per-part checksum, so
+  there's nothing for the SDK to validate. Per-part checksums only apply when a read
+  aligns to a stored part (not the default here).
 
 ## Verified
 
@@ -973,7 +993,6 @@ each tool prints its full flag list with `--help`:
 ```bash
 node src/benchmark.js --help          # download
 node src/upload-benchmark.js --help   # upload
-node src/upload-test-data.js --help   # seed
 ```
 
 ### Download (`src/benchmark.js`)
@@ -986,7 +1005,7 @@ node src/upload-test-data.js --help   # seed
 | `--sizes <s1,s2>` | `sizes` | Size labels, each optionally `<size>:<count>` |
 | `--prefix <p>` | `dataPrefix` | Key prefix used with `--sizes` |
 | `--workers <n>` | `workers` | Worker threads |
-| `--concurrency <n>` | `concurrency` | Concurrent `PartNumber` GETs per worker |
+| `--concurrency <n>` | `concurrency` | Concurrent ranged GETs per worker |
 | `--iterations <n>` | `iterations` | Measured iterations |
 | `--warmup <n>` | `warmup` | Unmeasured warmup iterations |
 | `--keep` | `keep` | Keep bodies in memory instead of draining |
@@ -1019,8 +1038,9 @@ node src/upload-test-data.js --help   # seed
 | `--json` | — | Emit JSON results to stdout |
 | `--out <file>` | — | Also write JSON results to a file |
 
-Total in-flight requests = `workers × concurrency`. Part **count and boundaries**
-come from the object's upload (`--part-size` at seed time), not a download flag.
+Total in-flight requests = `workers × concurrency`. The download **read size** is
+`rangeSize` in the `download` section (config-only), independent of the object's
+upload part size.
 
 ### Upload (`src/upload-benchmark.js`)
 
@@ -1040,18 +1060,6 @@ Shares the tuning flags above (`--workers`, `--concurrency`, `--iterations`,
 | `--client-chunk <size>` | `uploadClientChunk` | stream: simulated client push chunk size (default 1MiB) |
 | `--source-path <dir>` | `sourcePath` | Dir for the `file` source temp file |
 | `--force` | `forceUpload` | Upload even if a matching object exists |
-
-### Seed (`src/upload-test-data.js`)
-
-| Flag | Config key | Meaning |
-|------|-----------|---------|
-| `--bucket <name>` | `bucket` | S3 bucket |
-| `--region <r>` | `region` | AWS region |
-| `--sizes <s1,s2>` | `sizes` | Sizes to create (each optionally `<size>:<count>`) |
-| `--prefix <p>` | `dataPrefix` | Key prefix |
-| `--part-size <size>` | `partSize` | Multipart part size = download part boundary |
-| `--checksum <algo>` | `checksum` | Per-part checksum (`CRC32` fast; `CRC32C` pure-JS/slow) |
-| `--force` | `forceUpload` | Re-upload even if the object already exists |
 
 ### Sweep script env overrides
 
