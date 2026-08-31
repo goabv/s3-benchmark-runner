@@ -752,6 +752,9 @@ async function benchmarkGroup(cfg, group) {
 
   // 'file' mode: create + pre-size one output file per key. Skipped when fileDiscard
   // (workers drain ranges without writing, so there are no output files to size).
+  // We delete any stale file from a previous run HERE (up front) and KEEP the freshly
+  // downloaded file at the end (so it can be verified/inspected). Deleting up front
+  // reclaims the space before this run writes, so leftovers don't accumulate.
   let filePaths = null;
   if (cfg.deliveryMode === 'file' && !cfg.fileDiscard) {
     mkdirSync(cfg.deliveryPath, { recursive: true }); // openSync won't create parents
@@ -759,6 +762,7 @@ async function benchmarkGroup(cfg, group) {
     for (const { key, info } of infos) {
       const safe = key.replace(/[^\w.-]/g, '_');
       const fp = path.join(cfg.deliveryPath, `s3dlbench-${safe}`);
+      rmSync(fp, { force: true }); // drop last run's file first (fresh inode, reclaim space)
       const fd = openSync(fp, 'w');
       ftruncateSync(fd, info.totalSize);
       closeSync(fd);
@@ -906,7 +910,8 @@ async function benchmarkGroup(cfg, group) {
     }
   } finally {
     if (manager && !manager._closePromise) await manager.close().catch(() => {});
-    if (filePaths) for (const fp of Object.values(filePaths)) rmSync(fp, { force: true });
+    // Downloaded files are KEPT at the end (for verification/inspection); the next
+    // run deletes them up front. deliveryPath must have room for the full working set.
   }
 
   if (runCfg.timeseries && tsByIter.length) {

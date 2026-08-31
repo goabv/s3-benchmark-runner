@@ -573,23 +573,22 @@ Notes:
   memory and head-of-line-blocking cost of in-order delivery.
 - **ordered-stream** actually delivers the bytes to a consumer — see
   [Stream delivery](#stream-delivery-ordered-stream) below.
-- **file** writes to `deliveryPath` (default OS temp dir) and removes the file
-  after the run. Byte-integrity of the offset-based assembly is verified. Point
-  `deliveryPath` at a fast disk (NVMe) so storage doesn't become the bottleneck.
-  A leading `~` is expanded to your home directory, and the directory is created
-  automatically if missing. Each part's chunks are written in a single positional
-  `writev` (one syscall per part, not per chunk).
-- **file writes and the event loop:** by default the per-part write is a **blocking**
-  `writevSync`, so disk-write latency stalls that worker's socket draining. Set
-  `"fileAsync": true` in the `download` section to write on libuv's threadpool
-  instead, keeping the event loop free to drain sockets while writes are in flight
-  (per-worker writes stay bounded by `concurrency`). At high worker counts, raise
-  `UV_THREADPOOL_SIZE` (env var) so writes aren't queued behind the default 4-thread
-  pool. Use `fileAsync` when the disk is stalling your network numbers; leave it off
-  to see the honest blocking-write cost.
+- **file** writes each range to `deliveryPath` (default OS temp dir) at its byte
+  offset. The downloaded file is **kept after the run** (so you can verify/inspect
+  it); the *next* run deletes any stale file up front — so `deliveryPath` must have
+  room for the full working set. Point it at a fast disk (NVMe/striped) so storage
+  doesn't become the bottleneck. A leading `~` is expanded to your home directory,
+  and the directory is created automatically if missing.
+- **file writes and the event loop:** writes always go through libuv's threadpool
+  (async `fs.write`), so a disk write never blocks the worker's socket draining. The
+  pool is **process-global and shared across all workers**, so at high worker counts
+  raise `UV_THREADPOOL_SIZE` (env var) or writes queue behind the default 4 threads.
+  With `fileDirect` (default) each write uses **O_DIRECT** to bypass the page cache,
+  falling back to a buffered write for the final unaligned range or a filesystem that
+  rejects O_DIRECT. (The legacy `--no-api` slice path still honors `fileAsync`.)
 
   ```json
-  "download": { "deliveryMode": "file", "deliveryPath": "/mnt/nvme", "fileAsync": true }
+  "download": { "deliveryMode": "file", "deliveryPath": "/mnt/nvme", "fileDirect": true }
   ```
 - **discard** is the right mode for finding the NIC/CPU ceiling.
 
